@@ -145,7 +145,7 @@ def test_hydrogen_bonds(periodic_dim):
         # using minimum image convention
         atoms = place_over_periodic_boundary(atoms, periodic_dim, BOX_SIZE)
 
-    atoms.coord = hydride.relax_hydrogen(atoms)
+    atoms.coord = hydride.relax_hydrogen(atoms, box=box)
 
     if periodic_dim is not None:
         # Remove PBC again
@@ -293,7 +293,10 @@ def test_partial_charges(ethane, repulsive):
         exp_angle = 180
     else:
         exp_angle = 0
-    assert np.rad2deg(dihed) % 360 == pytest.approx(exp_angle, abs=1)
+    deg = np.rad2deg(dihed)
+    # shortest path to circle (eg 359.99 and 179.99 should work)
+    diff = (deg - exp_angle + 180) % 360 - 180
+    assert diff == pytest.approx(0, abs=1)
 
 
 def test_limited_iterations(atoms):
