@@ -18,7 +18,7 @@ from .add import add_hydrogen
 from .charge import estimate_amino_acid_charges
 from .fragments import FragmentLibrary
 from .names import AtomNameLibrary
-from .relax import relax_hydrogen
+from .rejax import relax_hydrogen
 
 
 class UserInputError(Exception):
@@ -86,6 +86,7 @@ def main(args=None):
         "--iterations",
         "-n",
         type=int,
+        default=50,
         metavar="NUMBER",
         help="The maximum number of relaxation iterations. "
         "The runtime of the relaxation scales approximately "
@@ -252,12 +253,13 @@ def run(args):
     if not args.no_relax:
         if args.iterations is not None and args.iterations < 0:
             raise UserInputError("The number of iterations must be positive")
-        model.coord = relax_hydrogen(
+        coord = relax_hydrogen(
             model,
             args.iterations,
             angle_increment=np.deg2rad(args.angle_increment),
             box=box,
         )
+        model.coord = np.array(coord)
 
     try:
         write_structure(args.outfile, args.outformat, model)
