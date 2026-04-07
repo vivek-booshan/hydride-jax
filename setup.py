@@ -1,9 +1,18 @@
 # This source code is part of the Biotite package and is distributed
 # under the 3-Clause BSD License. Please see 'LICENSE.rst' for further
 # information.
+import os
+import sys
+from os.path import abspath, dirname, join
+
+# Get the absolute path to the 'src' directory
+# Add 'src' to sys.path so 'import hydride' works
+setup_dir = abspath(dirname(__file__))
+src_path = join(setup_dir, "src")
+if src_path not in sys.path:
+    sys.path.insert(0, src_path)
 
 import fnmatch
-import os
 import pickle
 import warnings
 from os.path import abspath, dirname, isfile, join, normpath
@@ -15,6 +24,7 @@ from biotite.structure.info.ccd import get_ccd
 from Cython.Build import cythonize
 from setuptools import Extension, find_packages, setup
 
+from hydride import AtomNameLibrary, FragmentLibrary, __version__
 # Molecules that appear is most structures
 # Hence, there is a high importance to get the hydrogen conformations
 # for these molecules right
@@ -62,7 +72,7 @@ original_wd = os.getcwd()
 # Change directory to setup directory to ensure correct file identification
 os.chdir(dirname(abspath(__file__)))
 # Import is relative to working directory
-from src.hydride import AtomNameLibrary, FragmentLibrary, __version__
+from hydride import AtomNameLibrary, FragmentLibrary, __version__
 
 # Compile Cython into C
 try:
@@ -190,7 +200,6 @@ setup(
     # Include fragment and atom name libraries
     package_data={"hydride": ["*.pickle"]},
 )
-
 
 # Return to original directory
 os.chdir(original_wd)
