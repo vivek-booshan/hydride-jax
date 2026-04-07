@@ -222,6 +222,10 @@ def relax_hydrogen_jit(init_coord, rot_centers, rot_axes, is_free_mask, pairs,
 
 def relax_hydrogen(atoms, iterations=200, mask=None, angle_increment=None, 
                    return_trajectory=False, return_energies=False, partial_charges=None, box=None):
+    if iterations is None:
+        warnings.warn("passing None to iterations. Defaulting to 200")
+        iterations = 200
+
     atoms = atoms.copy()
 
     init_coord_np = atoms.coord
