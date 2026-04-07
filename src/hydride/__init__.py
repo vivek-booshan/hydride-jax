@@ -13,6 +13,6 @@ from .names import *
 
 # Module can only be imported if the C-extension has already been built
 try:
-    from .relax import *
+    from .rejax import *
 except ImportError:
     pass
