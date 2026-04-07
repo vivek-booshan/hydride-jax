@@ -12,6 +12,12 @@ import biotite.structure as struc
 import jax
 import jax.numpy as jnp
 
+# Extract Biotite constants
+ANY = struc.BondType.ANY
+SINGLE = struc.BondType.SINGLE
+DOUBLE = struc.BondType.DOUBLE
+AROMATIC_DOUBLE = struc.BondType.AROMATIC_DOUBLE
+
 # Values are taken from Rappé et al. (UFF)
 NB_VALUES = {
     "H" : (2.886, 0.044), "HE": (2.362, 0.056), "LI": (2.451, 0.025), "BE": (2.745, 0.085),
@@ -51,9 +57,13 @@ def get_relaxation_params(atoms, mask=None, partial_charges=None, force_cutoff=1
     if len(rotatable_bonds) == 0:
         return None
 
-    if box is True: box = atoms.box
+    # handle CLI box = true and/or box is none
+    # why the hell did they make box bool or matrix??
+    if box is True or (box is None):
+        box = atoms.box
+    elif box is False:
+        box = None
 
-    # Kinematics parameters
     B = len(rotatable_bonds)
     rot_centers = np.zeros((B, 3))
     rot_axes = np.zeros((B, 3))
@@ -67,7 +77,6 @@ def get_relaxation_params(atoms, mask=None, partial_charges=None, force_cutoff=1
         rot_axes[i] = axis / np.linalg.norm(axis)
         is_free_mask[i] = is_free
 
-    # Energy parameters
     if partial_charges is None:
         partial_charges = struc.partial_charges(atoms)
     partial_charges[np.isnan(partial_charges)] = 0.0
@@ -123,7 +132,7 @@ def get_relaxation_params(atoms, mask=None, partial_charges=None, force_cutoff=1
     )
 
 @jax.jit
-def apply_rotations(init_coord, thetas, rot_centers, rot_axes, atom_to_bond_idx):
+def apply_rotations(init_coord, thetas, rot_centers, rot_axes, atom_to_bond_idx, box=None):
     safe_bond_idx = jnp.where(atom_to_bond_idx == -1, 0, atom_to_bond_idx)
     centers = rot_centers[safe_bond_idx] 
     axes = rot_axes[safe_bond_idx]       
@@ -132,12 +141,21 @@ def apply_rotations(init_coord, thetas, rot_centers, rot_axes, atom_to_bond_idx)
     t = jnp.where(atom_to_bond_idx == -1, 0.0, t)
     vecs = init_coord - centers
     
+    if box is not None:
+        box_inv = jnp.linalg.inv(box)
+        frac = vecs @ box_inv
+        frac = frac - jnp.round(frac)
+        vecs = frac @ box
+        
     cos_t = jnp.cos(t)[:, None]
     sin_t = jnp.sin(t)[:, None]
     
     cross = jnp.cross(axes, vecs)
     dot = jnp.sum(axes * vecs, axis=-1, keepdims=True)
-    return centers + vecs * cos_t + cross * sin_t + axes * dot * (1 - cos_t)
+    rotated_vecs = vecs * cos_t + cross * sin_t + axes * dot * (1 - cos_t)
+    
+    new_coord = init_coord + (rotated_vecs - vecs)
+    return jnp.where(atom_to_bond_idx[:, None] == -1, init_coord, new_coord)
 
 @jax.jit
 def compute_energy(coord, pairs, elec_param, eps, r_6, r_12, box=None):
@@ -156,31 +174,38 @@ def compute_energy(coord, pairs, elec_param, eps, r_6, r_12, box=None):
 @jax.jit(static_argnames=("iterations", "return_trajectory"))
 def relax_hydrogen_jit(init_coord, rot_centers, rot_axes, is_free_mask, pairs, 
                        elec_param, eps, r_6, r_12, atom_to_bond_idx, box=None, 
-                       iterations: int = 200, return_trajectory: bool = False):
+                       iterations: int = 200, return_trajectory: bool = False,
+                       start_angle: float = 0.0):
     B = rot_centers.shape[0]
-    thetas, m, v = jnp.zeros(B), jnp.zeros(B), jnp.zeros(B)
+    
+    # Tiny offset added to ensure perfectly balanced states have gradient
+    thetas = jnp.full(B, start_angle + 1e-3)
+    m = jnp.zeros(B)
+    v = jnp.zeros(B)
     lr = 0.1
     
     def scan_body(carry, _):
         t, m_t, v_t, step = carry
         
         def loss_fn(ang):
-            c = apply_rotations(init_coord, ang, rot_centers, rot_axes, atom_to_bond_idx)
+            c = apply_rotations(init_coord, ang, rot_centers, rot_axes, atom_to_bond_idx, box)
             return compute_energy(c, pairs, elec_param, eps, r_6, r_12, box)
 
         loss, grads = jax.value_and_grad(loss_fn)(t)
         grads = jnp.where(is_free_mask, grads, 0.0)
         
+        progress = step / iterations
+        lr_t = lr * 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
+        
         m_next = 0.9 * m_t + 0.1 * grads
         v_next = 0.999 * v_t + 0.001 * (grads ** 2)
         m_hat = m_next / (1 - 0.9 ** (step + 1))
         v_hat = v_next / (1 - 0.999 ** (step + 1))
-        t_next = t - lr * m_hat / (jnp.sqrt(v_hat) + 1e-8)
+        t_next = t - lr_t * m_hat / (jnp.sqrt(v_hat) + 1e-8)
         
-        # Only compute coord if we need the trajectory, otherwise save compute
         coord_t = jax.lax.cond(
             return_trajectory,
-            lambda: apply_rotations(init_coord, t_next, rot_centers, rot_axes, atom_to_bond_idx),
+            lambda: apply_rotations(init_coord, t_next, rot_centers, rot_axes, atom_to_bond_idx, box),
             lambda: jnp.zeros_like(init_coord) 
         )
         return (t_next, m_next, v_next, step + 1), (coord_t, loss)
@@ -189,13 +214,16 @@ def relax_hydrogen_jit(init_coord, rot_centers, rot_axes, is_free_mask, pairs,
         scan_body, (thetas, m, v, 0), jnp.arange(iterations)
     )
 
-    final_coord = apply_rotations(init_coord, final_thetas, rot_centers, rot_axes, atom_to_bond_idx)
+    energies = jax.lax.cummin(energies)
+
+    final_coord = apply_rotations(init_coord, final_thetas, rot_centers, rot_axes, atom_to_bond_idx, box)
     return final_coord, trajectory, energies
 
 
 def relax_hydrogen(atoms, iterations=200, mask=None, angle_increment=None, 
                    return_trajectory=False, return_energies=False, partial_charges=None, box=None):
     atoms = atoms.copy()
+
     init_coord_np = atoms.coord
     
     params = get_relaxation_params(atoms, mask, partial_charges, box=box)
@@ -206,25 +234,33 @@ def relax_hydrogen(atoms, iterations=200, mask=None, angle_increment=None,
         if return_trajectory: return np.array([init_coord_np])
         return init_coord_np
 
-    final_coord, trajectory, energies = relax_hydrogen_jit(
-        jnp.array(init_coord_np), *params, 
-        iterations=iterations, return_trajectory=return_trajectory
-    )
+    best_coord, best_traj, best_energies = None, None, None
+    min_final_energy = float('inf')
+
+    # Start at 0, 120, and 240 degrees to bypass any energy barriers reliably
+    for ang in [0.0, 2.0 * np.pi / 3.0, 4.0 * np.pi / 3.0]:
+        f_coord, traj, ener = relax_hydrogen_jit(
+            jnp.array(init_coord_np), *params, 
+            iterations=iterations, return_trajectory=return_trajectory,
+            start_angle=ang
+        )
+        f_energy = ener[-1] if len(ener) > 0 else 0.0
+        
+        if f_energy < min_final_energy:
+            min_final_energy = f_energy
+            best_coord = f_coord
+            best_traj = traj
+            best_energies = ener
 
     if return_trajectory:
-        out_coord = np.array(trajectory, copy=True).astype(np.float32)
+        out_coord = np.array(best_traj, copy=True).astype(np.float32)
     else:
-        out_coord = np.array(final_coord, copy=True).astype(np.float32)
+        out_coord = np.array(best_coord, copy=True).astype(np.float32)
         
     if return_energies:
-        return out_coord, np.array(energies, copy=True)
+        return out_coord, np.array(best_energies, copy=True)
     return out_coord
 
-# Extract Biotite constants
-ANY = struc.BondType.ANY
-SINGLE = struc.BondType.SINGLE
-DOUBLE = struc.BondType.DOUBLE
-AROMATIC_DOUBLE = struc.BondType.AROMATIC_DOUBLE
 
 def _find_rotatable_bonds(atoms, mask=None):
     if mask is None:
