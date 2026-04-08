@@ -10,9 +10,5 @@ from .add import *
 from .charge import *
 from .fragments import *
 from .names import *
+from .relax import *
 
-# Module can only be imported if the C-extension has already been built
-try:
-    from .rejax import *
-except ImportError:
-    pass
