@@ -2,8 +2,10 @@
    :width: 400
    :align: center
 
-Hydride - Adding hydrogen atoms to molecular models
-===================================================
+Hydride-jax - Adding hydrogen atoms to molecular models
+=======================================================
+
+NOTE: the only difference is relax_hydrogen now uses jax to allow for jax.grad in larger pipelines
 
 Many tasks in structural biology ranging from simulations and hydrogen
 bond detection to mere visual analysis, require complete molecular
@@ -28,13 +30,13 @@ organic molecule - from small ligands to large protein complexes.
 Installation
 ------------
 
-In order to use *Hydride* you need to have Python (at least 3.7) installed.
+In order to use *Hydride-jax* you need to have Python (at least 3.10) installed.
 
-You can install *Hydride* via
+You can install *Hydride-jax* via
 
 .. code-block:: console
 
-   $ pip install hydride
+   $ uv add git+https://github.com/vivek-booshan/hydride-jax
 
 
 Usage
