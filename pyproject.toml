@@ -18,22 +18,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest"]
-lint = ["ruff==0.5.2"]
 cuda = ["jax[cuda12]"]
+rocm = ["jax[rocm]"]
 
 [project.scripts]
 hydride = "hydride.cli:main"
 
 [build-system]
-requires = [
-    "setuptools >= 61.0",
-    "wheel",
-    "cython >= 3.0",
-    "numpy >= 2.0",
-    "biotite >= 1.0",
-    "msgpack >= 0.5.6"
-]
+requires = ["setuptools >= 61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -46,6 +38,7 @@ hydride = ["*.pickle"]
 [dependency-groups]
 dev = [
     "jedi>=0.19.2",
+    "jedi-language-server>=0.46.0",
     "pytest>=9.0.3",
     "ruff>=0.5.2",
 ]
