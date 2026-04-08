@@ -10,7 +10,7 @@ import biotite.structure.io.pdbx as pdbx
 import numpy as np
 import pytest
 import hydride
-from hydride.rejax import _find_rotatable_bonds
+from hydride.relax import _find_rotatable_bonds
 from tests.util import data_dir, place_over_periodic_boundary
 
 

@@ -18,7 +18,7 @@ from .add import add_hydrogen
 from .charge import estimate_amino_acid_charges
 from .fragments import FragmentLibrary
 from .names import AtomNameLibrary
-from .rejax import relax_hydrogen
+from .relax import relax_hydrogen
 
 
 class UserInputError(Exception):
