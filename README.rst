@@ -7,6 +7,7 @@ Hydride-jax - Adding hydrogen atoms to molecular models
 
 NOTE: the only difference is relax_hydrogen now uses jax to allow for jax.grad in larger pipelines additionally, the transition from cython to jax fundamentally changes the optimization from a discrete, heuristic-based search to a continuous, gradient-based refinement.
 While the physics (the UFF force field and electrostatics) remains the same, the "path" the computer takes to find the optimal hydrogen positions is entirely different.
+
 .. list-table::
    :widths: 20 40 40
    :header-rows: 1
