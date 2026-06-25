@@ -205,7 +205,7 @@ def relax_hydrogen_jit(init_coord, rot_centers, rot_axes, is_free_mask, pairs,
         
         coord_t = jax.lax.cond(
             return_trajectory,
-            lambda: apply_rotations(init_coord, t_next, rot_centers, rot_axes, atom_to_bond_idx, box),
+            lambda: apply_rotations(init_coord, t_next, rot_centers, rot_axes, atom_to_bond_idx, box).astype(init_coord.dtype),
             lambda: jnp.zeros_like(init_coord) 
         )
         return (t_next, m_next, v_next, step + 1), (coord_t, loss)
