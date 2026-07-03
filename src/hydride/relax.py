@@ -62,9 +62,11 @@ def get_relaxation_params(atoms, mask=None, partial_charges=None, force_cutoff=1
     elif box is False:
         box = None
 
-    # Cast box to float32 explicitly to satisfy Biotite's Cython signatures
     if box is not None:
         box = np.asarray(box, dtype=np.float32)
+        box_inv = np.linalg.inv(box).astype(np.float32)
+    else:
+        box_inv = None
 
     B = len(rotatable_bonds)
     center_indices = np.zeros(B, dtype=np.int32)
@@ -127,11 +129,12 @@ def get_relaxation_params(atoms, mask=None, partial_charges=None, force_cutoff=1
         jnp.array(pairs, dtype=jnp.int32), jnp.array(elec_param, dtype=jnp.float32),
         jnp.array(eps, dtype=jnp.float32), jnp.array(r_6, dtype=jnp.float32), 
         jnp.array(r_12, dtype=jnp.float32), jnp.array(atom_to_group, dtype=jnp.int32),
-        jnp.array(box) if box is not None else None
+        jnp.array(box) if box is not None else None,
+        jnp.array(box_inv) if box_inv is not None else None
     )
 
 @jax.jit
-def apply_rotations(init_coord, thetas, rot_centers, rot_axes, atom_to_bond_idx, box=None):
+def apply_rotations(init_coord, thetas, rot_centers, rot_axes, atom_to_bond_idx, box=None, box_inv=None):
     safe_bond_idx = jnp.where(atom_to_bond_idx == -1, 0, atom_to_bond_idx)
     centers = rot_centers[safe_bond_idx] 
     axes = rot_axes[safe_bond_idx]       
@@ -140,11 +143,19 @@ def apply_rotations(init_coord, thetas, rot_centers, rot_axes, atom_to_bond_idx,
     t = jnp.where(atom_to_bond_idx == -1, 0.0, t)
     vecs = init_coord - centers
     
-    if box is not None:
-        box_inv = jnp.linalg.inv(box)
-        frac = vecs @ box_inv
-        frac = frac - jnp.round(frac)
-        vecs = frac @ box
+    if box is not None and box_inv is not None:
+        frac_x = vecs[:, 0] * box_inv[0, 0] + vecs[:, 1] * box_inv[1, 0] + vecs[:, 2] * box_inv[2, 0]
+        frac_y = vecs[:, 0] * box_inv[0, 1] + vecs[:, 1] * box_inv[1, 1] + vecs[:, 2] * box_inv[2, 1]
+        frac_z = vecs[:, 0] * box_inv[0, 2] + vecs[:, 1] * box_inv[1, 2] + vecs[:, 2] * box_inv[2, 2]
+        
+        frac_x = frac_x - jnp.round(frac_x)
+        frac_y = frac_y - jnp.round(frac_y)
+        frac_z = frac_z - jnp.round(frac_z)
+        
+        vecs_x = frac_x * box[0, 0] + frac_y * box[1, 0] + frac_z * box[2, 0]
+        vecs_y = frac_x * box[0, 1] + frac_y * box[1, 1] + frac_z * box[2, 1]
+        vecs_z = frac_x * box[0, 2] + frac_y * box[1, 2] + frac_z * box[2, 2]
+        vecs = jnp.stack([vecs_x, vecs_y, vecs_z], axis=-1)
         
     cos_t = jnp.cos(t)[:, None]
     sin_t = jnp.sin(t)[:, None]
@@ -157,33 +168,52 @@ def apply_rotations(init_coord, thetas, rot_centers, rot_axes, atom_to_bond_idx,
     return jnp.where(atom_to_bond_idx[:, None] == -1, init_coord, new_coord)
 
 @jax.jit
-def compute_energy(coord, pairs, elec_param, eps, r_6, r_12, box=None):
+def compute_energy(coord, pairs, elec_param, eps, r_6, r_12, box=None, box_inv=None):
     delta = coord[pairs[:, 0]] - coord[pairs[:, 1]]
-    if box is not None:
-        box_inv = jnp.linalg.inv(box)
-        frac_delta = delta @ box_inv
-        frac_delta = frac_delta - jnp.round(frac_delta)
-        delta = frac_delta @ box
+    if box is not None and box_inv is not None:
+        frac_x = delta[:, 0] * box_inv[0, 0] + delta[:, 1] * box_inv[1, 0] + delta[:, 2] * box_inv[2, 0]
+        frac_y = delta[:, 0] * box_inv[0, 1] + delta[:, 1] * box_inv[1, 1] + delta[:, 2] * box_inv[2, 1]
+        frac_z = delta[:, 0] * box_inv[0, 2] + delta[:, 1] * box_inv[1, 2] + delta[:, 2] * box_inv[2, 2]
         
-    dist_sq = jnp.sum(delta**2, axis=-1)
-    dist_6 = dist_sq ** 3
-    e_nb = eps * (r_12 / (dist_6 ** 2) - 2 * r_6 / dist_6)
-    return jnp.sum(elec_param / jnp.sqrt(dist_sq) + e_nb)
+        frac_x = frac_x - jnp.round(frac_x)
+        frac_y = frac_y - jnp.round(frac_y)
+        frac_z = frac_z - jnp.round(frac_z)
+        
+        delta_x = frac_x * box[0, 0] + frac_y * box[1, 0] + frac_z * box[2, 0]
+        delta_y = frac_x * box[0, 1] + frac_y * box[1, 1] + frac_z * box[2, 1]
+        delta_z = frac_x * box[0, 2] + frac_y * box[1, 2] + frac_z * box[2, 2]
+        
+        dist_sq = delta_x * delta_x + delta_y * delta_y + delta_z * delta_z
+    else:
+        dist_sq = jnp.sum(delta * delta, axis=-1)
+        
+    dist_6 = dist_sq * dist_sq * dist_sq
+    dist_12 = dist_6 * dist_6
+    e_nb = eps * (r_12 / dist_12 - 2.0 * r_6 / dist_6)
+    return jnp.sum(elec_param / jnp.sqrt(dist_sq + 1e-8) + e_nb)
 
 @jax.jit(static_argnames=("iterations", "return_trajectory"))
 def relax_hydrogen_jit(init_coord, center_indices, axis_indices, is_free_mask, pairs, 
-                       elec_param, eps, r_6, r_12, atom_to_bond_idx, box=None, 
+                       elec_param, eps, r_6, r_12, atom_to_bond_idx, box=None, box_inv=None,
                        iterations: int = 200, return_trajectory: bool = False,
                        start_angle: float = 0.0):
     B = center_indices.shape[0]
     
-    # Kinematics are dynamically mapped here to make them fully differentiable
     raw_axes = init_coord[center_indices] - init_coord[axis_indices]
-    if box is not None:
-        box_inv = jnp.linalg.inv(box)
-        frac = raw_axes @ box_inv
-        frac = frac - jnp.round(frac)
-        raw_axes = frac @ box
+    if box is not None and box_inv is not None:
+        frac_x = raw_axes[:, 0] * box_inv[0, 0] + raw_axes[:, 1] * box_inv[1, 0] + raw_axes[:, 2] * box_inv[2, 0]
+        frac_y = raw_axes[:, 0] * box_inv[0, 1] + raw_axes[:, 1] * box_inv[1, 1] + raw_axes[:, 2] * box_inv[2, 1]
+        frac_z = raw_axes[:, 0] * box_inv[0, 2] + raw_axes[:, 1] * box_inv[1, 2] + raw_axes[:, 2] * box_inv[2, 2]
+        
+        frac_x = frac_x - jnp.round(frac_x)
+        frac_y = frac_y - jnp.round(frac_y)
+        frac_z = frac_z - jnp.round(frac_z)
+        
+        axes_x = frac_x * box[0, 0] + frac_y * box[1, 0] + frac_z * box[2, 0]
+        axes_y = frac_x * box[0, 1] + frac_y * box[1, 1] + frac_z * box[2, 1]
+        axes_z = frac_x * box[0, 2] + frac_y * box[1, 2] + frac_z * box[2, 2]
+        raw_axes = jnp.stack([axes_x, axes_y, axes_z], axis=-1)
+
     rot_axes = raw_axes / (jnp.linalg.norm(raw_axes, axis=-1, keepdims=True) + 1e-8)
     rot_centers = init_coord[center_indices]
     
@@ -192,14 +222,13 @@ def relax_hydrogen_jit(init_coord, center_indices, axis_indices, is_free_mask, p
     v = jnp.zeros(B)
     lr = 0.1
     
-    # Gradient checkpointing added to keep backprop memory constant
     @jax.checkpoint
     def scan_body(carry, _):
         t, m_t, v_t, step = carry
         
         def loss_fn(ang):
-            c = apply_rotations(init_coord, ang, rot_centers, rot_axes, atom_to_bond_idx, box)
-            return compute_energy(c, pairs, elec_param, eps, r_6, r_12, box)
+            c = apply_rotations(init_coord, ang, rot_centers, rot_axes, atom_to_bond_idx, box, box_inv)
+            return compute_energy(c, pairs, elec_param, eps, r_6, r_12, box, box_inv)
 
         loss, grads = jax.value_and_grad(loss_fn)(t)
         grads = jnp.where(is_free_mask, grads, 0.0)
@@ -215,7 +244,7 @@ def relax_hydrogen_jit(init_coord, center_indices, axis_indices, is_free_mask, p
         
         coord_t = jax.lax.cond(
             return_trajectory,
-            lambda: apply_rotations(init_coord, t_next, rot_centers, rot_axes, atom_to_bond_idx, box).astype(init_coord.dtype),
+            lambda: apply_rotations(init_coord, t_next, rot_centers, rot_axes, atom_to_bond_idx, box, box_inv).astype(init_coord.dtype),
             lambda: jnp.zeros_like(init_coord) 
         )
         return (t_next, m_next, v_next, step + 1), (coord_t, loss)
@@ -225,7 +254,7 @@ def relax_hydrogen_jit(init_coord, center_indices, axis_indices, is_free_mask, p
     )
 
     energies = jax.lax.cummin(energies)
-    final_coord = apply_rotations(init_coord, final_thetas, rot_centers, rot_axes, atom_to_bond_idx, box)
+    final_coord = apply_rotations(init_coord, final_thetas, rot_centers, rot_axes, atom_to_bond_idx, box, box_inv)
     return final_coord, trajectory, energies
 
 def relax_hydrogen(atoms, iterations=200, mask=None, angle_increment=None, 
@@ -249,7 +278,9 @@ def relax_hydrogen(atoms, iterations=200, mask=None, angle_increment=None,
 
     for ang in [0.0, 2.0 * np.pi / 3.0, 4.0 * np.pi / 3.0]:
         f_coord, traj, ener = relax_hydrogen_jit(
-            jnp.array(init_coord_np), *params, 
+            jnp.array(init_coord_np), 
+            params[0], params[1], params[2], params[3], params[4], 
+            params[5], params[6], params[7], params[8], params[9], params[10],
             iterations=iterations, return_trajectory=return_trajectory,
             start_angle=ang
         )
