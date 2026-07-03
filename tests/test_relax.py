@@ -367,3 +367,67 @@ def test_atom_mask(atoms):
 
     assert (test_coord[~mask] == ref_coord[~mask]).all()
     assert not (test_coord[mask] == ref_coord[mask]).all()
+
+def test_relax_hydrogen_differentiability(ethane):
+    """
+    Test that the unrolled hydrogen relaxation loop can be differentiated
+    with respect to the initial heavy atom coordinates, producing non-vanishing
+    gradients due to the dynamic center and axis kinematics mapping.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    # Unpack the relaxation parameters from the ethane fixture
+    params = hydride.get_relaxation_params(ethane)
+    assert params is not None
+    (
+        center_indices,
+        axis_indices,
+        is_free_mask,
+        pairs,
+        elec_param,
+        eps,
+        r_6,
+        r_12,
+        atom_to_bond_idx,
+        box,
+    ) = params
+
+    # Perturb a heavy atom (Carbon at index 0) to push the system out of
+    # equilibrium and guarantee non-zero geometric gradients
+    perturbed_coord = ethane.coord.copy()
+    perturbed_coord[0] += np.array([0.1, -0.1, 0.05], dtype=np.float32)
+    init_coord = jnp.array(perturbed_coord)
+
+    # Define a scalar loss function with respect to the starting coordinates
+    def scalar_loss(coords):
+        final_coord, _, energies = hydride.relax_hydrogen_jit(
+            coords,
+            center_indices,
+            axis_indices,
+            is_free_mask,
+            pairs,
+            elec_param,
+            eps,
+            r_6,
+            r_12,
+            atom_to_bond_idx,
+            box=box,
+            iterations=5,  # Low iteration count suffices to verify gradient flow
+        )
+        # Use the final optimized energy as the scalar target
+        return energies[-1]
+
+    # Differentiate the loop with respect to the initial coordinates
+    grads = jax.grad(scalar_loss)(init_coord)
+
+    # Assertions to ensure gradients flow correctly and cleanly
+    assert jnp.isfinite(grads).all(), "Gradients contain NaN or Inf values."
+    assert jnp.any(grads != 0.0), "Gradients completely vanished to zero."
+
+    # Verify explicitly that heavy atoms (indices 0 and 1) receive gradients
+    # This confirms that moving a heavy atom correctly alters the hydrogen potential energy
+    heavy_atom_grads = grads[:2]
+    assert jnp.any(
+        heavy_atom_grads != 0.0
+    ), "Heavy atom gradients vanished; kinematic chain rule broken."
