@@ -124,9 +124,18 @@ def get_relaxation_params(atoms, mask=None, partial_charges=None, force_cutoff=1
             r_12.append(r6**2)
             eps.append(np.sqrt(scale_i * scale_j))
 
+    pairs_np = np.array(pairs, dtype=np.int32)
+    if pairs_np.size > 0:
+        sort_idx = np.argsort(pairs_np[:, 0])
+        pairs_np = pairs_np[sort_idx]
+        elec_param = np.array(elec_param, dtype=np.float32)[sort_idx]
+        eps = np.array(eps, dtype=np.float32)[sort_idx]
+        r_6 = np.array(r_6, dtype=np.float32)[sort_idx]
+        r_12 = np.array(r_12, dtype=np.float32)[sort_idx]
+
     return (
         jnp.array(center_indices), jnp.array(axis_indices), jnp.array(is_free_mask),
-        jnp.array(pairs, dtype=jnp.int32), jnp.array(elec_param, dtype=jnp.float32),
+        jnp.array(pairs_np, dtype=jnp.int32), jnp.array(elec_param, dtype=jnp.float32),
         jnp.array(eps, dtype=jnp.float32), jnp.array(r_6, dtype=jnp.float32), 
         jnp.array(r_12, dtype=jnp.float32), jnp.array(atom_to_group, dtype=jnp.int32),
         jnp.array(box) if box is not None else None,
@@ -167,8 +176,13 @@ def apply_rotations(init_coord, thetas, rot_centers, rot_axes, atom_to_bond_idx,
     new_coord = init_coord + (rotated_vecs - vecs)
     return jnp.where(atom_to_bond_idx[:, None] == -1, init_coord, new_coord)
 
-@jax.jit
+
+# Decorate with custom_vjp up-front to prevent compilation NameError issues
+@jax.custom_vjp
 def compute_energy(coord, pairs, elec_param, eps, r_6, r_12, box=None, box_inv=None):
+    return _compute_energy_fwd(coord, pairs, elec_param, eps, r_6, r_12, box, box_inv)[0]
+
+def _compute_energy_fwd(coord, pairs, elec_param, eps, r_6, r_12, box=None, box_inv=None):
     delta = coord[pairs[:, 0]] - coord[pairs[:, 1]]
     if box is not None and box_inv is not None:
         frac_x = delta[:, 0] * box_inv[0, 0] + delta[:, 1] * box_inv[1, 0] + delta[:, 2] * box_inv[2, 0]
@@ -182,15 +196,39 @@ def compute_energy(coord, pairs, elec_param, eps, r_6, r_12, box=None, box_inv=N
         delta_x = frac_x * box[0, 0] + frac_y * box[1, 0] + frac_z * box[2, 0]
         delta_y = frac_x * box[0, 1] + frac_y * box[1, 1] + frac_z * box[2, 1]
         delta_z = frac_x * box[0, 2] + frac_y * box[1, 2] + frac_z * box[2, 2]
-        
         dist_sq = delta_x * delta_x + delta_y * delta_y + delta_z * delta_z
+        wrapped_delta = jnp.stack([delta_x, delta_y, delta_z], axis=-1)
     else:
         dist_sq = jnp.sum(delta * delta, axis=-1)
+        wrapped_delta = delta
         
     dist_6 = dist_sq * dist_sq * dist_sq
     dist_12 = dist_6 * dist_6
     e_nb = eps * (r_12 / dist_12 - 2.0 * r_6 / dist_6)
-    return jnp.sum(elec_param / jnp.sqrt(dist_sq + 1e-8) + e_nb)
+    energy = jnp.sum(elec_param / jnp.sqrt(dist_sq + 1e-8) + e_nb)
+    
+    return energy, (coord, pairs, elec_param, eps, r_6, r_12, box, box_inv, wrapped_delta, dist_sq, dist_6)
+
+def _compute_energy_bwd(res, g):
+    coord, pairs, elec_param, eps, r_6, r_12, box, box_inv, wrapped_delta, dist_sq, dist_6 = res
+    
+    inv_dist_sq = 1.0 / (dist_sq + 1e-8)
+    inv_dist_1 = jnp.sqrt(inv_dist_sq)
+    
+    de_elec = -0.5 * elec_param * (inv_dist_sq * inv_dist_1)
+    de_vdw = eps * 6.0 * inv_dist_sq * (-r_12 / (dist_6 * dist_6) + r_6 / dist_6)
+    dE_ddist_sq = (de_elec + de_vdw) * g
+    
+    pair_forces = 2.0 * dE_ddist_sq[..., None] * wrapped_delta
+    
+    grad_coord = jnp.zeros_like(coord)
+    grad_coord = grad_coord.at[pairs[:, 0]].add(pair_forces)
+    grad_coord = grad_coord.at[pairs[:, 1]].add(-pair_forces)
+    
+    return grad_coord, None, None, None, None, None, None, None
+
+compute_energy.defvjp(_compute_energy_fwd, _compute_energy_bwd)
+
 
 @jax.jit(static_argnames=("iterations", "return_trajectory"))
 def relax_hydrogen_jit(init_coord, center_indices, axis_indices, is_free_mask, pairs, 
