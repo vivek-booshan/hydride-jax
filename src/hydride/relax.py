@@ -12,13 +12,11 @@ import biotite.structure as struc
 import jax
 import jax.numpy as jnp
 
-# Extract Biotite constants
 ANY = struc.BondType.ANY
 SINGLE = struc.BondType.SINGLE
 DOUBLE = struc.BondType.DOUBLE
 AROMATIC_DOUBLE = struc.BondType.AROMATIC_DOUBLE
 
-# Values are taken from Rappé et al. (UFF)
 NB_VALUES = {
     "H" : (2.886, 0.044), "HE": (2.362, 0.056), "LI": (2.451, 0.025), "BE": (2.745, 0.085),
     "B" : (4.083, 0.180), "C" : (3.851, 0.105), "N" : (3.660, 0.069), "O" : (3.500, 0.060),
@@ -53,7 +51,6 @@ HBOND_FACTOR = 0.79
 
 def get_relaxation_params(atoms, mask=None, partial_charges=None, force_cutoff=10.0, box=None):
     rotatable_bonds = _find_rotatable_bonds(atoms, mask)
-    
     if len(rotatable_bonds) == 0:
         return None
 
@@ -125,7 +122,9 @@ def get_relaxation_params(atoms, mask=None, partial_charges=None, force_cutoff=1
             eps.append(np.sqrt(scale_i * scale_j))
 
     pairs_np = np.array(pairs, dtype=np.int32)
-    if pairs_np.size > 0:
+    num_pairs = len(pairs_np)
+    
+    if num_pairs > 0:
         sort_idx = np.argsort(pairs_np[:, 0])
         pairs_np = pairs_np[sort_idx]
         elec_param = np.array(elec_param, dtype=np.float32)[sort_idx]
@@ -133,13 +132,30 @@ def get_relaxation_params(atoms, mask=None, partial_charges=None, force_cutoff=1
         r_6 = np.array(r_6, dtype=np.float32)[sort_idx]
         r_12 = np.array(r_12, dtype=np.float32)[sort_idx]
 
+        # Generate atomic-free reduction map structures to prevent memory locks
+        flat_indices = np.concatenate([pairs_np[:, 0], pairs_np[:, 1]])
+        flat_signs = np.concatenate([np.ones(num_pairs, dtype=np.float32), np.full(num_pairs, -1.0, dtype=np.float32)])
+        flat_pair_map = np.concatenate([np.arange(num_pairs, dtype=np.int32), np.arange(num_pairs, dtype=np.int32)])
+        
+        sort_reduction = np.argsort(flat_indices)
+        reduction_indices = flat_indices[sort_reduction]
+        reduction_signs = flat_signs[sort_reduction]
+        reduction_pair_map = flat_pair_map[sort_reduction]
+    else:
+        reduction_indices = np.zeros(0, dtype=np.int32)
+        reduction_signs = np.zeros(0, dtype=np.float32)
+        reduction_pair_map = np.zeros(0, dtype=np.int32)
+
     return (
         jnp.array(center_indices), jnp.array(axis_indices), jnp.array(is_free_mask),
         jnp.array(pairs_np, dtype=jnp.int32), jnp.array(elec_param, dtype=jnp.float32),
         jnp.array(eps, dtype=jnp.float32), jnp.array(r_6, dtype=jnp.float32), 
         jnp.array(r_12, dtype=jnp.float32), jnp.array(atom_to_group, dtype=jnp.int32),
         jnp.array(box) if box is not None else None,
-        jnp.array(box_inv) if box_inv is not None else None
+        jnp.array(box_inv) if box_inv is not None else None,
+        jnp.array(reduction_indices, dtype=jnp.int32),
+        jnp.array(reduction_signs, dtype=jnp.float32),
+        jnp.array(reduction_pair_map, dtype=jnp.int32)
     )
 
 @jax.jit
@@ -177,12 +193,14 @@ def apply_rotations(init_coord, thetas, rot_centers, rot_axes, atom_to_bond_idx,
     return jnp.where(atom_to_bond_idx[:, None] == -1, init_coord, new_coord)
 
 
-# Decorate with custom_vjp up-front to prevent compilation NameError issues
 @jax.custom_vjp
-def compute_energy(coord, pairs, elec_param, eps, r_6, r_12, box=None, box_inv=None):
-    return _compute_energy_fwd(coord, pairs, elec_param, eps, r_6, r_12, box, box_inv)[0]
+def compute_energy(coord, pairs, elec_param, eps, r_6, r_12, box=None, box_inv=None, 
+                   reduction_indices=None, reduction_signs=None, reduction_pair_map=None):
+    return _compute_energy_fwd(coord, pairs, elec_param, eps, r_6, r_12, box, box_inv, 
+                               reduction_indices, reduction_signs, reduction_pair_map)[0]
 
-def _compute_energy_fwd(coord, pairs, elec_param, eps, r_6, r_12, box=None, box_inv=None):
+def _compute_energy_fwd(coord, pairs, elec_param, eps, r_6, r_12, box=None, box_inv=None,
+                       reduction_indices=None, reduction_signs=None, reduction_pair_map=None):
     delta = coord[pairs[:, 0]] - coord[pairs[:, 1]]
     if box is not None and box_inv is not None:
         frac_x = delta[:, 0] * box_inv[0, 0] + delta[:, 1] * box_inv[1, 0] + delta[:, 2] * box_inv[2, 0]
@@ -207,10 +225,12 @@ def _compute_energy_fwd(coord, pairs, elec_param, eps, r_6, r_12, box=None, box_
     e_nb = eps * (r_12 / dist_12 - 2.0 * r_6 / dist_6)
     energy = jnp.sum(elec_param / jnp.sqrt(dist_sq + 1e-8) + e_nb)
     
-    return energy, (coord, pairs, elec_param, eps, r_6, r_12, box, box_inv, wrapped_delta, dist_sq, dist_6)
+    return energy, (coord, pairs, elec_param, eps, r_6, r_12, box, box_inv, wrapped_delta, dist_sq, dist_6, 
+                    reduction_indices, reduction_signs, reduction_pair_map)
 
 def _compute_energy_bwd(res, g):
-    coord, pairs, elec_param, eps, r_6, r_12, box, box_inv, wrapped_delta, dist_sq, dist_6 = res
+    (coord, pairs, elec_param, eps, r_6, r_12, box, box_inv, wrapped_delta, dist_sq, dist_6, 
+     reduction_indices, reduction_signs, reduction_pair_map) = res
     
     inv_dist_sq = 1.0 / (dist_sq + 1e-8)
     inv_dist_1 = jnp.sqrt(inv_dist_sq)
@@ -221,11 +241,11 @@ def _compute_energy_bwd(res, g):
     
     pair_forces = 2.0 * dE_ddist_sq[..., None] * wrapped_delta
     
-    grad_coord = jnp.zeros_like(coord)
-    grad_coord = grad_coord.at[pairs[:, 0]].add(pair_forces)
-    grad_coord = grad_coord.at[pairs[:, 1]].add(-pair_forces)
+    # Run coalesced GPU Segment Reductions to map pairwise interactions instantly
+    mapped_forces = pair_forces[reduction_pair_map] * reduction_signs[..., None]
+    grad_coord = jax.ops.segment_sum(mapped_forces, reduction_indices, num_segments=coord.shape[0])
     
-    return grad_coord, None, None, None, None, None, None, None
+    return grad_coord, None, None, None, None, None, None, None, None, None, None
 
 compute_energy.defvjp(_compute_energy_fwd, _compute_energy_bwd)
 
@@ -233,6 +253,7 @@ compute_energy.defvjp(_compute_energy_fwd, _compute_energy_bwd)
 @jax.jit(static_argnames=("iterations", "return_trajectory"))
 def relax_hydrogen_jit(init_coord, center_indices, axis_indices, is_free_mask, pairs, 
                        elec_param, eps, r_6, r_12, atom_to_bond_idx, box=None, box_inv=None,
+                       reduction_indices=None, reduction_signs=None, reduction_pair_map=None,
                        iterations: int = 200, return_trajectory: bool = False,
                        start_angle: float = 0.0):
     B = center_indices.shape[0]
@@ -266,7 +287,8 @@ def relax_hydrogen_jit(init_coord, center_indices, axis_indices, is_free_mask, p
         
         def loss_fn(ang):
             c = apply_rotations(init_coord, ang, rot_centers, rot_axes, atom_to_bond_idx, box, box_inv)
-            return compute_energy(c, pairs, elec_param, eps, r_6, r_12, box, box_inv)
+            return compute_energy(c, pairs, elec_param, eps, r_6, r_12, box, box_inv, 
+                                  reduction_indices, reduction_signs, reduction_pair_map)
 
         loss, grads = jax.value_and_grad(loss_fn)(t)
         grads = jnp.where(is_free_mask, grads, 0.0)
@@ -319,6 +341,7 @@ def relax_hydrogen(atoms, iterations=200, mask=None, angle_increment=None,
             jnp.array(init_coord_np), 
             params[0], params[1], params[2], params[3], params[4], 
             params[5], params[6], params[7], params[8], params[9], params[10],
+            params[11], params[12], params[13],
             iterations=iterations, return_trajectory=return_trajectory,
             start_angle=ang
         )

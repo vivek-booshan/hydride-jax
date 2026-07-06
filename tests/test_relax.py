@@ -391,7 +391,10 @@ def test_relax_hydrogen_differentiability(ethane):
         r_12,
         atom_to_bond_idx,
         box,
-        box_inv
+        box_inv,
+        reduction_indices,
+        reduction_signs,
+        reduction_pair_map,
     ) = params
 
     # Perturb a heavy atom (Carbon at index 0) to push the system out of
@@ -415,6 +418,9 @@ def test_relax_hydrogen_differentiability(ethane):
             atom_to_bond_idx,
             box=box,
             box_inv=box_inv,
+            reduction_indices=reduction_indices,
+            reduction_signs=reduction_signs,
+            reduction_pair_map=reduction_pair_map,
             iterations=5,  # Low iteration count suffices to verify gradient flow
         )
         # Use the final optimized energy as the scalar target
