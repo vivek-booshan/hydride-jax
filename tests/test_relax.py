@@ -410,3 +410,68 @@ def test_relax_hydrogen_differentiability(ethane):
     assert jnp.any(
         heavy_atom_grads != 0.0
     ), "Heavy atom gradients vanished; kinematic chain rule broken."
+
+def test_hydrogen_kinematics_corotation(atoms):
+    """
+    Test that the implicit hydrogen placement (NeRF kinematics) perfectly
+    co-rotates and co-translates hydrogens when the parent heavy atoms undergo
+    a rigid body SE(3) transformation[cite: 7].
+    """
+    import jax.numpy as jnp
+
+    # Extract the relaxation parameters containing the NeRF topology[cite: 7]
+    params = hydride.get_relaxation_params(atoms)
+    assert params is not None
+
+    # Unpack the specific NeRF kinematic arrays appended to the base parameters
+    p1_idx = params[14]
+    p2_idx = params[15]
+    p3_idx = params[16]
+    ref_v = params[17]
+    use_ref_v = params[18]
+    lengths = params[19]
+    angles = params[20]
+    torsions = params[21]
+    h_mask = params[22]
+
+    X_initial = jnp.array(atoms.coord)
+
+    # 1. Place hydrogens in the original baseline frame
+    X_H_baseline = hydride.relax.place_hydrogens_jit(
+        X_initial, p1_idx, p2_idx, p3_idx, ref_v, use_ref_v,
+        lengths, angles, torsions, h_mask
+    )
+
+    # 2. Generate a random rigid body SE(3) transformation
+    np.random.seed(42)
+    translation = np.random.uniform(-10.0, 10.0, size=3).astype(np.float32)
+    angle_x, angle_y, angle_z = np.random.uniform(-np.pi, np.pi, size=3)
+
+    # 3. Transform heavy atoms
+    transformed_atoms = atoms.copy()
+    transformed_atoms.coord = struc.rotate(transformed_atoms.coord, (angle_x, angle_y, angle_z))
+    transformed_atoms.coord += translation
+    X_heavy_transformed = jnp.array(transformed_atoms.coord)
+
+    # 4. Place hydrogens using the rotated and translated heavy atoms
+    X_H_transformed = hydride.relax.place_hydrogens_jit(
+        X_heavy_transformed, p1_idx, p2_idx, p3_idx, ref_v, use_ref_v,
+        lengths, angles, torsions, h_mask
+    )
+
+    # 5. Explicitly apply the identical transformation to the baseline coordinates
+    dummy_array = atoms.copy()
+    dummy_array.coord = np.array(X_H_baseline)
+    dummy_array.coord = struc.rotate(dummy_array.coord, (angle_x, angle_y, angle_z))
+    dummy_array.coord += translation
+    X_H_expected = dummy_array.coord
+
+    # 6. Assert that implicitly placed hydrogens perfectly track the heavy atom frames
+    # We exclusively check hydrogens governed by internal p3 frames (use_ref_v == False)
+    # as global fallback reference vectors for 2-atom systems do not co-rotate by definition.
+    mask_to_check = np.array(h_mask) & ~np.array(use_ref_v)
+
+    placed_hydrogens = np.array(X_H_transformed)[mask_to_check]
+    expected_hydrogens = X_H_expected[mask_to_check]
+
+    np.testing.assert_allclose(placed_hydrogens, expected_hydrogens, atol=1e-4)

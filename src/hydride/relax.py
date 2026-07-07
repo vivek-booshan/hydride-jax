@@ -159,78 +159,6 @@ def _original_get_relaxation_params(atoms, mask=None, partial_charges=None, forc
         jnp.array(reduction_pair_map, dtype=jnp.int32)
     )
 
-def get_relaxation_params(atoms, mask=None, partial_charges=None, box=None):
-    base_params = _original_get_relaxation_params(atoms, mask, partial_charges, box=box)
-    if base_params is None:
-        return None
-        
-    center_indices = base_params[0]
-    axis_indices = base_params[1]
-    atom_to_bond_idx = base_params[8]
-    
-    num_atoms = atoms.array_length()
-    p1_idx = np.arange(num_atoms, dtype=int)
-    p2_idx = np.roll(p1_idx, 1)
-    ref_v = np.tile(np.array([1.0, 0.0, 0.0], dtype=np.float32), (num_atoms, 1))
-    
-    bonds, _ = atoms.bonds.get_all_bonds()
-    heavy_mask = (atoms.element != "H") & (atoms.element != "D")
-    h_mask = ~heavy_mask
-    heavy_indices = np.where(heavy_mask)[0]
-    coord = atoms.coord
-    
-    def min_image_np(vecs):
-        if box is None: return vecs
-        box_inv = np.linalg.inv(box)
-        frac = vecs @ box_inv
-        frac -= np.round(frac)
-        return frac @ box
-    
-    for h in np.where(h_mask)[0]:
-        b = atom_to_bond_idx[h]
-        if b != -1:
-            # For rotatable hydrogens, the NeRF axis MUST perfectly align with Hydride's rotation axis
-            p1 = center_indices[b]
-            p2 = axis_indices[b]
-        else:
-            # For locked hydrogens, pick the bonded atom and the nearest secondary heavy atom
-            bonded = [n for n in bonds[h] if n != -1 and heavy_mask[n]]
-            p1 = bonded[0] if bonded else heavy_indices[0]
-            vecs_to_heavy = min_image_np(coord[heavy_indices] - coord[p1])
-            dists = np.linalg.norm(vecs_to_heavy, axis=-1)
-            sorted_heavy = heavy_indices[np.argsort(dists)]
-            p2 = sorted_heavy[1] if len(sorted_heavy) > 1 else p1
-            
-        v1_vec = min_image_np(coord[p2] - coord[p1])
-        v1_vec = v1_vec / (np.linalg.norm(v1_vec) + 1e-8)
-        
-        v_r = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-        if np.abs(np.dot(v1_vec, v_r)) > 0.9:
-            v_r = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-            
-        p1_idx[h] = p1
-        p2_idx[h] = p2
-        ref_v[h] = v_r
-        
-    v1 = min_image_np(coord[p2_idx] - coord[p1_idx])
-    v1 = v1 / (np.linalg.norm(v1, axis=-1, keepdims=True) + 1e-8)
-    
-    n = np.cross(v1, ref_v)
-    n = n / (np.linalg.norm(n, axis=-1, keepdims=True) + 1e-8)
-    
-    v = np.cross(n, v1)
-    
-    delta = min_image_np(coord - coord[p1_idx])
-    x = np.sum(delta * v1, axis=-1)
-    y = np.sum(delta * v, axis=-1)
-    z = np.sum(delta * n, axis=-1)
-    
-    lengths = np.linalg.norm(delta, axis=-1)
-    angles = np.arctan2(np.hypot(y, z), x)
-    torsions = np.arctan2(z, y)
-    
-    return tuple(base_params) + (p1_idx, p2_idx, ref_v, lengths, angles, torsions, h_mask)
-
 @jax.custom_vjp
 def compute_energy(coord, pairs, elec_param, eps, r_6, r_12, box=None, box_inv=None, 
                    reduction_indices=None, reduction_signs=None, reduction_pair_map=None):
@@ -287,23 +215,125 @@ def _compute_energy_bwd(res, g):
 
 compute_energy.defvjp(_compute_energy_fwd, _compute_energy_bwd)
 
-def build_local_frames(p1, p2, p3):
-    """Builds differentiable orthonormal frames for a batch of atoms."""
-    v1 = p2 - p1
-    v1 = v1 / jnp.linalg.norm(v1, axis=-1, keepdims=True)
+def _get_nerf_params(atoms, atom_to_bond_idx, center_indices, axis_indices, box=None):
+    """Calculates stable NeRF (Natural Extension Reference Frame) parameters for all hydrogens."""
+    num_atoms = atoms.array_length()
     
-    v2 = p3 - p1
-    n = jnp.cross(v1, v2)
-    n = n / jnp.linalg.norm(n, axis=-1, keepdims=True)
+    p1_idx = np.zeros(num_atoms, dtype=int)
+    p2_idx = np.zeros(num_atoms, dtype=int)
+    p3_idx = np.zeros(num_atoms, dtype=int)
+    ref_v = np.zeros((num_atoms, 3), dtype=np.float32)
+    use_ref_v = np.zeros(num_atoms, dtype=bool)
     
-    v = jnp.cross(n, v1)
-    # Stack into a (N, 3, 3) rotation matrix
-    return jnp.stack([v1, v, n], axis=-1)
+    bonds, _ = atoms.bonds.get_all_bonds()
+    heavy_mask = (atoms.element != "H") & (atoms.element != "D")
+    h_mask = ~heavy_mask
+    
+    h_indices = np.where(h_mask)[0]
+    heavy_indices = np.where(heavy_mask)[0]
+    coord = atoms.coord
+    
+    def min_image_np(vecs):
+        if box is None: return vecs
+        box_inv = np.linalg.inv(box)
+        frac = vecs @ box_inv
+        frac -= np.round(frac)
+        return frac @ box
+    
+    for h in h_indices:
+        b = atom_to_bond_idx[h]
+        if b != -1:
+            # Enforce strict alignment with Hydride's energy axis for rotatable bonds
+            p1 = center_indices[b]
+            p2 = axis_indices[b]
+        else:
+            bonded = [n for n in bonds[h] if n != -1 and heavy_mask[n]]
+            p1 = bonded[0] if bonded else heavy_indices[0]
+            vecs_to_heavy = min_image_np(coord[heavy_indices] - coord[p1])
+            dists = np.linalg.norm(vecs_to_heavy, axis=-1)
+            sorted_heavy = heavy_indices[np.argsort(dists)]
+            p2 = sorted_heavy[1] if len(sorted_heavy) > 1 else p1
+            
+        vecs_to_heavy = min_image_np(coord[heavy_indices] - coord[p1])
+        dists = np.linalg.norm(vecs_to_heavy, axis=-1)
+        sorted_heavy = heavy_indices[np.argsort(dists)]
+        
+        v1_vec = min_image_np(coord[p2] - coord[p1])
+        v1_vec = v1_vec / (np.linalg.norm(v1_vec) + 1e-8)
+        
+        # Discover a robust p3 to complete the local rotameric frame
+        found_p3 = False
+        for candidate in sorted_heavy:
+            if candidate == p1 or candidate == p2:
+                continue
+            v2_vec = min_image_np(coord[candidate] - coord[p1])
+            v2_vec = v2_vec / (np.linalg.norm(v2_vec) + 1e-8)
+            if np.linalg.norm(np.cross(v1_vec, v2_vec)) > 1e-2:
+                p3 = candidate
+                found_p3 = True
+                break
+                
+        if found_p3:
+            p1_idx[h] = p1
+            p2_idx[h] = p2
+            p3_idx[h] = p3
+            use_ref_v[h] = False
+        else:
+            # Fallback for collinear molecules (<3 heavy atoms like Ethane)
+            v_r = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            if np.abs(np.dot(v1_vec, v_r)) > 0.9:
+                v_r = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            v_r = v_r - np.dot(v1_vec, v_r) * v1_vec
+            v_r = v_r / (np.linalg.norm(v_r) + 1e-8)
+            
+            p1_idx[h] = p1
+            p2_idx[h] = p2
+            p3_idx[h] = p1
+            ref_v[h] = v_r
+            use_ref_v[h] = True
+            
+    v1 = min_image_np(coord[p2_idx] - coord[p1_idx])
+    v1 = v1 / (np.linalg.norm(v1, axis=-1, keepdims=True) + 1e-8)
+    
+    v2 = np.where(use_ref_v[:, None], ref_v, min_image_np(coord[p3_idx] - coord[p1_idx]))
+    
+    n = np.cross(v1, v2)
+    n = n / (np.linalg.norm(n, axis=-1, keepdims=True) + 1e-8)
+    
+    v = np.cross(n, v1)
+    
+    delta = min_image_np(coord - coord[p1_idx])
+    x = np.sum(delta * v1, axis=-1)
+    y = np.sum(delta * v, axis=-1)
+    z = np.sum(delta * n, axis=-1)
+    
+    lengths = np.linalg.norm(delta, axis=-1)
+    angles = np.arctan2(np.hypot(y, z), x)
+    torsions = np.arctan2(z, y)
+    
+    return p1_idx, p2_idx, p3_idx, ref_v, use_ref_v, lengths, angles, torsions, h_mask
+
+
+def get_relaxation_params(atoms, mask=None, partial_charges=None, box=None):
+    base_params = _original_get_relaxation_params(atoms, mask, partial_charges, box=box)
+    if base_params is None:
+        return None
+        
+    atom_to_bond_idx = base_params[8]
+    center_indices = base_params[0]
+    axis_indices = base_params[1]
+    
+    p1, p2, p3, ref_v, use_ref_v, lengths, angles, torsions, h_mask = _get_nerf_params(
+        atoms, atom_to_bond_idx, center_indices, axis_indices, box=box
+    )
+    return tuple(base_params) + (p1, p2, p3, ref_v, use_ref_v, lengths, angles, torsions, h_mask)
+
 
 @jax.jit
-def place_hydrogens_jit(X_heavy, p1_idx, p2_idx, ref_v, lengths, angles, torsions, h_mask, mobile_h_mask, box=None, box_inv=None):
+def place_hydrogens_jit(X_heavy, p1_idx, p2_idx, p3_idx, ref_v, use_ref_v, lengths, angles, torsions, h_mask, box=None, box_inv=None):
     p1 = X_heavy[p1_idx]
     p2 = X_heavy[p2_idx]
+    p3 = X_heavy[p3_idx]
     
     v1 = p2 - p1
     if box is not None and box_inv is not None:
@@ -313,7 +343,15 @@ def place_hydrogens_jit(X_heavy, p1_idx, p2_idx, ref_v, lengths, angles, torsion
         
     v1 = v1 / jnp.sqrt(jnp.sum(v1**2, axis=-1, keepdims=True) + 1e-12)
     
-    n = jnp.cross(v1, ref_v)
+    v2 = p3 - p1
+    if box is not None and box_inv is not None:
+        frac2 = jnp.einsum('...i,ij->...j', v2, box_inv)
+        frac2 = frac2 - jnp.round(frac2)
+        v2 = jnp.einsum('...i,ij->...j', frac2, box)
+        
+    v2 = jnp.where(use_ref_v[:, None], ref_v, v2)
+    
+    n = jnp.cross(v1, v2)
     n = n / jnp.sqrt(jnp.sum(n**2, axis=-1, keepdims=True) + 1e-12)
     
     v = jnp.cross(n, v1)
@@ -325,26 +363,24 @@ def place_hydrogens_jit(X_heavy, p1_idx, p2_idx, ref_v, lengths, angles, torsion
     X_H = p1 + x[:, None]*v1 + y[:, None]*v + z[:, None]*n
     
     if box is not None and box_inv is not None:
-        # Wrap X_H back to the original periodic image to pass Biotite sequence/contiguous checks
         diff = X_H - X_heavy
         frac = jnp.einsum('...i,ij->...j', diff, box_inv)
         frac = frac - jnp.round(frac)
         X_H = X_heavy + jnp.einsum('...i,ij->...j', frac, box)
     
-    return jnp.where(mobile_h_mask[:, None], X_H, X_heavy)
+    # We always rebuild all hydrogens from NeRF to guarantee they co-move safely with heavy atoms
+    return jnp.where(h_mask[:, None], X_H, X_heavy)
 
 
 @functools.partial(jax.jit, static_argnames=("iterations", "return_trajectory"))
 def relax_hydrogen_jit(
     X_initial, center_indices, axis_indices, is_free_mask, pairs, elec_param, eps, r_6, r_12,
     atom_to_bond_idx, box, box_inv, reduction_indices, reduction_signs, reduction_pair_map,
-    p1_idx, p2_idx, ref_v, lengths, angles, initial_torsions, h_mask,
+    p1_idx, p2_idx, p3_idx, ref_v, use_ref_v, lengths, angles, initial_torsions, h_mask,
     iterations=200, return_trajectory=False, start_angle=0.0
 ):
     num_atoms = X_initial.shape[0]
     B = center_indices.shape[0]
-    
-    mobile_h_mask = h_mask & (atom_to_bond_idx != -1)
     
     init_delta_torsions = jnp.full(B, start_angle + 1e-3)
     init_m = jnp.zeros(B)
@@ -356,7 +392,9 @@ def relax_hydrogen_jit(
         d_t_padded = jnp.append(d_t, 0.0)
         atom_shifts = d_t_padded[atom_to_bond_idx]
         current_torsions = initial_torsions + atom_shifts
-        return place_hydrogens_jit(X_initial, p1_idx, p2_idx, ref_v, lengths, angles, current_torsions, h_mask, mobile_h_mask, box, box_inv)
+        return place_hydrogens_jit(
+            X_initial, p1_idx, p2_idx, p3_idx, ref_v, use_ref_v, lengths, angles, current_torsions, h_mask, box, box_inv
+        )
 
     def scan_body(carry, i):
         d_torsions, m_t, v_t = carry
@@ -459,12 +497,14 @@ def relax_hydrogen(atoms, iterations=200, mask=None, angle_increment=None,
             best_traj = traj
             best_energies = ener
 
-    # Correctly targets index 8 (atom_to_group) to accurately build a 1D atom mask
+    # params[8] is atom_to_bond_idx. params[-1] is h_mask.
     mobile_h_mask_np = np.array(params[-1] & (params[8] != -1))
+    if mask is not None:
+        mobile_h_mask_np &= mask
 
     if return_trajectory:
         out_coord = np.array(best_traj, copy=True).astype(np.float32)
-        # Multi-frame slicing ensures unmasked atoms remain perfectly uniform across the trajectory
+        # Restore multi-frame 3D coordinates for locked atoms
         out_coord[:, ~mobile_h_mask_np, :] = init_coord_np[~mobile_h_mask_np, :]
     else:
         out_coord = np.array(best_coord, copy=True).astype(np.float32)
