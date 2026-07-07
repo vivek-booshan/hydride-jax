@@ -380,22 +380,6 @@ def test_relax_hydrogen_differentiability(ethane):
     # Unpack the relaxation parameters from the ethane fixture
     params = hydride.get_relaxation_params(ethane)
     assert params is not None
-    (
-        center_indices,
-        axis_indices,
-        is_free_mask,
-        pairs,
-        elec_param,
-        eps,
-        r_6,
-        r_12,
-        atom_to_bond_idx,
-        box,
-        box_inv,
-        reduction_indices,
-        reduction_signs,
-        reduction_pair_map,
-    ) = params
 
     # Perturb a heavy atom (Carbon at index 0) to push the system out of
     # equilibrium and guarantee non-zero geometric gradients
@@ -407,20 +391,7 @@ def test_relax_hydrogen_differentiability(ethane):
     def scalar_loss(coords):
         final_coord, _, energies = hydride.relax_hydrogen_jit(
             coords,
-            center_indices,
-            axis_indices,
-            is_free_mask,
-            pairs,
-            elec_param,
-            eps,
-            r_6,
-            r_12,
-            atom_to_bond_idx,
-            box=box,
-            box_inv=box_inv,
-            reduction_indices=reduction_indices,
-            reduction_signs=reduction_signs,
-            reduction_pair_map=reduction_pair_map,
+            *params,
             iterations=5,  # Low iteration count suffices to verify gradient flow
         )
         # Use the final optimized energy as the scalar target
