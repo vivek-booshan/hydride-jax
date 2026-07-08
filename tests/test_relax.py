@@ -475,3 +475,108 @@ def test_hydrogen_kinematics_corotation(atoms):
     expected_hydrogens = X_H_expected[mask_to_check]
 
     np.testing.assert_allclose(placed_hydrogens, expected_hydrogens, atol=1e-4)
+
+def test_nerf_topology_adversarial():
+    """
+    Adversarial test: Construct a molecule where the closest spatial atom
+    is NOT the covalent parent. The implicit hydrogen must resolve its
+    local frame using the covalent bond, not distance.
+    """
+    # Create a system: C1 - C2, with H attached to C1.
+    # Place a non-bonded C3 very close to H to tempt a distance-based frame selector.
+    atoms = struc.AtomArray(4)
+    atoms.element = np.array(["C", "C", "C", "H"])
+    # C1 at origin, C2 at 1.5A, C3 at 1.0A (but not bonded to H), H bonded to C1 at 1.1A
+    atoms.coord = np.array([
+        [0.0, 0.0, 0.0],    # C1
+        [1.5, 0.0, 0.0],    # C2
+        [0.0, 1.0, 0.0],    # C3 (Close to H, but not bonded)
+        [0.0, 0.0, 1.1]     # H (Bonded to C1)
+    ])
+    atoms.bonds = struc.BondList(4, np.array([[0, 1, 1], [0, 3, 1]]))
+
+    # Trigger the NeRF parameter calculation
+    atom_to_bond_idx = np.array([-1, -1, -1, -1], dtype=np.int32)
+    center_indices = np.zeros(0, dtype=np.int32)
+    axis_indices = np.zeros(0, dtype=np.int32)
+
+    # This call uses the internal graph-traversal logic
+    p1, p2, p3, ref_v, use_ref_v, lengths, angles, torsions, h_mask = hydride.relax._get_nerf_params(
+        atoms, atom_to_bond_idx, center_indices, axis_indices
+    )
+
+    # ADVERSARIAL CHECK:
+    # If the logic incorrectly picked C3 (closest distance) as p2,
+    # it would fail this check. It must pick C2 (covalent neighbor).
+    hydrogen_idx = 3
+    c1_idx = 0
+    c2_idx = 1
+
+    assert p1[hydrogen_idx] == c1_idx, "NeRF frame failed to identify covalent parent P1"
+    assert p2[hydrogen_idx] == c2_idx, "NeRF frame incorrectly prioritized distance over covalent connectivity"
+
+def test_nerf_topology_independence_from_spatial_proximity():
+    """
+    Adversarial test: A topologically rigid NeRF frame must be immune to the 
+    spatial translation of nearby, non-bonded atoms. 
+    Distance-based heuristics will fail this by latching onto the nearby atom.
+    """
+    import numpy as np
+    import jax.numpy as jnp
+    import biotite.structure as struc
+    import hydride
+    
+    # Construct: H(4) - C1(0) - C2(1) - C3(2) 
+    # O4(3) is an unbonded oxygen placed very close to C1 to act as a spatial trap.
+    atoms = struc.AtomArray(5)
+    atoms.element = np.array(["C", "C", "C", "O", "H"])
+    atoms.coord = np.array([
+        [0.0, 0.0, 0.0],    # 0: C1
+        [1.5, 0.0, 0.0],    # 1: C2
+        [2.0, 1.5, 0.0],    # 2: C3
+        [0.0, 1.2, 0.0],    # 3: O4 (Trap: closer to C1 than C2/C3)
+        [0.0, 0.0, 1.0]     # 4: H
+    ])
+    
+    # Define the covalent graph, explicitly omitting O4
+    atoms.bonds = struc.BondList(5, np.array([
+        [0, 1, 1], # C1 - C2
+        [1, 2, 1], # C2 - C3
+        [0, 4, 1]  # C1 - H
+    ]))
+    
+    # Extract parameters using the current implementation
+    params = hydride.get_relaxation_params(atoms)
+    
+    p1_idx, p2_idx, p3_idx = params[14], params[15], params[16]
+    ref_v, use_ref_v = params[17], params[18]
+    lengths, angles, torsions, h_mask = params[19], params[20], params[21], params[22]
+    
+    # Baseline placement
+    X_heavy_base = jnp.array(atoms.coord)
+    H_base = hydride.relax.place_hydrogens_jit(
+        X_heavy_base, p1_idx, p2_idx, p3_idx, ref_v, use_ref_v, lengths, angles, torsions, h_mask
+    )[4] # Get the H atom coords
+    
+    # Move the trap atom (O4) far away
+    atoms_moved = atoms.copy()
+    atoms_moved.coord[3] += np.array([10.0, 10.0, 10.0])
+    
+    # Re-place the hydrogen using the NEW heavy atom coordinates but the SAME NeRF parameters
+    X_heavy_moved = jnp.array(atoms_moved.coord)
+    H_moved = hydride.relax.place_hydrogens_jit(
+        X_heavy_moved, p1_idx, p2_idx, p3_idx, ref_v, use_ref_v, lengths, angles, torsions, h_mask
+    )[4]
+    
+    # Explicitly verify the topological graph traversal worked
+    assert p2_idx[4] == 1, "P2 should be the covalently bonded C2, not the closer O4."
+    assert p3_idx[4] == 2, "P3 should be the next bonded C3, not the closer O4."
+
+    # If the NeRF frame was topologically sound, it ignored O4 entirely.
+    # Thus, the H position should be completely unchanged relative to the C1-C2-C3 frame.
+    np.testing.assert_allclose(
+        np.array(H_moved), 
+        np.array(H_base), 
+        atol=1e-5, 
+        err_msg="Hydrogen frame was corrupted by non-bonded spatial neighbors!"
+    )

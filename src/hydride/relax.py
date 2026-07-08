@@ -216,7 +216,7 @@ def _compute_energy_bwd(res, g):
 compute_energy.defvjp(_compute_energy_fwd, _compute_energy_bwd)
 
 def _get_nerf_params(atoms, atom_to_bond_idx, center_indices, axis_indices, box=None):
-    """Calculates stable NeRF (Natural Extension Reference Frame) parameters for all hydrogens."""
+    """Calculates chemically rigid NeRF parameters using exact covalent graph traversal."""
     num_atoms = atoms.array_length()
     
     p1_idx = np.zeros(num_atoms, dtype=int)
@@ -247,25 +247,27 @@ def _get_nerf_params(atoms, atom_to_bond_idx, center_indices, axis_indices, box=
             p1 = center_indices[b]
             p2 = axis_indices[b]
         else:
-            bonded = [n for n in bonds[h] if n != -1 and heavy_mask[n]]
-            p1 = bonded[0] if bonded else heavy_indices[0]
-            vecs_to_heavy = min_image_np(coord[heavy_indices] - coord[p1])
-            dists = np.linalg.norm(vecs_to_heavy, axis=-1)
-            sorted_heavy = heavy_indices[np.argsort(dists)]
-            p2 = sorted_heavy[1] if len(sorted_heavy) > 1 else p1
+            # For fixed hydrogens, traverse the covalent graph to find P1 and P2
+            h_neighbors = [n for n in bonds[h] if n != -1 and heavy_mask[n]]
+            p1 = h_neighbors[0] if h_neighbors else heavy_indices[0]
             
-        vecs_to_heavy = min_image_np(coord[heavy_indices] - coord[p1])
-        dists = np.linalg.norm(vecs_to_heavy, axis=-1)
-        sorted_heavy = heavy_indices[np.argsort(dists)]
+            p1_neighbors = [n for n in bonds[p1] if n != -1 and heavy_mask[n] and n != h]
+            p2 = p1_neighbors[0] if p1_neighbors else p1
+            
+        # Topologically discover P3 to complete the local rotameric frame
+        p3_candidates = []
+        if p2 != p1:
+            # 1. Prefer heavy atoms bonded to P2 (standard dihedrals)
+            p3_candidates.extend([n for n in bonds[p2] if n != -1 and heavy_mask[n] and n != p1])
+        # 2. Fallback to other heavy atoms bonded to P1 (branched centers)
+        p3_candidates.extend([n for n in bonds[p1] if n != -1 and heavy_mask[n] and n != p2 and n != h])
         
+        found_p3 = False
         v1_vec = min_image_np(coord[p2] - coord[p1])
         v1_vec = v1_vec / (np.linalg.norm(v1_vec) + 1e-8)
         
-        # Discover a robust p3 to complete the local rotameric frame
-        found_p3 = False
-        for candidate in sorted_heavy:
-            if candidate == p1 or candidate == p2:
-                continue
+        # Ensure the chosen P3 is not collinear with P1-P2
+        for candidate in p3_candidates:
             v2_vec = min_image_np(coord[candidate] - coord[p1])
             v2_vec = v2_vec / (np.linalg.norm(v2_vec) + 1e-8)
             if np.linalg.norm(np.cross(v1_vec, v2_vec)) > 1e-2:
@@ -279,7 +281,7 @@ def _get_nerf_params(atoms, atom_to_bond_idx, center_indices, axis_indices, box=
             p3_idx[h] = p3
             use_ref_v[h] = False
         else:
-            # Fallback for collinear molecules (<3 heavy atoms like Ethane)
+            # Fallback for perfectly collinear or isolated molecules (e.g., water, ethane)
             v_r = np.array([1.0, 0.0, 0.0], dtype=np.float32)
             if np.abs(np.dot(v1_vec, v_r)) > 0.9:
                 v_r = np.array([0.0, 1.0, 0.0], dtype=np.float32)
@@ -312,7 +314,6 @@ def _get_nerf_params(atoms, atom_to_bond_idx, center_indices, axis_indices, box=
     torsions = np.arctan2(z, y)
     
     return p1_idx, p2_idx, p3_idx, ref_v, use_ref_v, lengths, angles, torsions, h_mask
-
 
 def get_relaxation_params(atoms, mask=None, partial_charges=None, box=None):
     base_params = _original_get_relaxation_params(atoms, mask, partial_charges, box=box)
