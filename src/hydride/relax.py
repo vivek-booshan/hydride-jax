@@ -11,14 +11,13 @@ import numpy as np
 import biotite.structure as struc
 import jax
 import jax.numpy as jnp
+import functools
 
-# Extract Biotite constants
 ANY = struc.BondType.ANY
 SINGLE = struc.BondType.SINGLE
 DOUBLE = struc.BondType.DOUBLE
 AROMATIC_DOUBLE = struc.BondType.AROMATIC_DOUBLE
 
-# Values are taken from Rappé et al. (UFF)
 NB_VALUES = {
     "H" : (2.886, 0.044), "HE": (2.362, 0.056), "LI": (2.451, 0.025), "BE": (2.745, 0.085),
     "B" : (4.083, 0.180), "C" : (3.851, 0.105), "N" : (3.660, 0.069), "O" : (3.500, 0.060),
@@ -51,70 +50,70 @@ NB_VALUES = {
 HBOND_ELEMENTS = ("N", "O", "F", "S", "CL")
 HBOND_FACTOR = 0.79
 
-def get_relaxation_params(atoms, mask=None, partial_charges=None, force_cutoff=10.0, box=None):
+def _original_get_relaxation_params(atoms, mask=None, partial_charges=None, force_cutoff=10.0, box=None):
     rotatable_bonds = _find_rotatable_bonds(atoms, mask)
-    
     if len(rotatable_bonds) == 0:
         return None
 
-    # handle CLI box = true and/or box is none
-    # why the hell did they make box bool or matrix??
     if box is True or (box is None):
         box = atoms.box
     elif box is False:
         box = None
 
+    if box is not None:
+        box = np.asarray(box, dtype=np.float32)
+        box_inv = np.linalg.inv(box).astype(np.float32)
+    else:
+        box_inv = None
+
     B = len(rotatable_bonds)
-    rot_centers = np.zeros((B, 3))
-    rot_axes = np.zeros((B, 3))
+    center_indices = np.zeros(B, dtype=np.int32)
+    axis_indices = np.zeros(B, dtype=np.int32)
     is_free_mask = np.ones(B, dtype=bool)
-    
+
     for i, (c_idx, b_idx, is_free, h_indices) in enumerate(rotatable_bonds):
-        rot_centers[i] = atoms.coord[c_idx]
-        axis = atoms.coord[c_idx] - atoms.coord[b_idx]
-        if box is not None:
-            axis = struc.displacement(atoms.coord[b_idx], atoms.coord[c_idx], box)
-        rot_axes[i] = axis / np.linalg.norm(axis)
+        center_indices[i] = c_idx
+        axis_indices[i] = b_idx
         is_free_mask[i] = is_free
 
     if partial_charges is None:
         partial_charges = struc.partial_charges(atoms)
     partial_charges[np.isnan(partial_charges)] = 0.0
-    
+
     atom_to_group = np.full(atoms.array_length(), -1, dtype=np.int32)
     for bond_idx, (_, _, _, h_indices) in enumerate(rotatable_bonds):
         atom_to_group[h_indices] = bond_idx
-        
+
     if box is None:
         cell_list = struc.CellList(atoms, cell_size=force_cutoff)
     else:
         cell_list = struc.CellList(atoms, cell_size=force_cutoff, periodic=True, box=box)
-        
+
     relevant_indices = np.where(atom_to_group != -1)[0].astype(np.int32)
     adj_indices = cell_list.get_atoms(atoms.coord[relevant_indices], radius=force_cutoff)
     bond_indices = atoms.bonds.get_all_bonds()[0]
     elements = np.char.upper(atoms.element)
-    
+
     pairs, r_6, r_12, eps, elec_param = [], [], [], [], []
     hbond_mask = np.isin(elements, HBOND_ELEMENTS)
-    
+
     for i_idx, atom_i in enumerate(relevant_indices):
         group_i = atom_to_group[atom_i]
         bonded_atom_i = bond_indices[atom_i, 0]
-        
+
         for atom_j in adj_indices[i_idx]:
             if atom_j == -1 or atom_j <= atom_i: continue
             if group_i == atom_to_group[atom_j]: continue
             if bonded_atom_i == atom_j: continue
-                
+
             element_j = elements[atom_j]
             if element_j not in NB_VALUES:
                 continue
-                
+
             pairs.append((atom_i, atom_j))
             elec = 332.0673 * (partial_charges[atom_i] * partial_charges[atom_j])
             elec_param.append(elec)
-            
+
             r_i, scale_i = NB_VALUES[elements[atom_i]]
             r_j, scale_j = NB_VALUES[element_j]
             hb_factor = HBOND_FACTOR if (bonded_atom_i != -1 and hbond_mask[bonded_atom_i] and hbond_mask[atom_j]) else 1.0
@@ -123,101 +122,348 @@ def get_relaxation_params(atoms, mask=None, partial_charges=None, force_cutoff=1
             r_12.append(r6**2)
             eps.append(np.sqrt(scale_i * scale_j))
 
+    pairs_np = np.array(pairs, dtype=np.int32)
+    num_pairs = len(pairs_np)
+
+    if num_pairs > 0:
+        sort_idx = np.argsort(pairs_np[:, 0])
+        pairs_np = pairs_np[sort_idx]
+        elec_param = np.array(elec_param, dtype=np.float32)[sort_idx]
+        eps = np.array(eps, dtype=np.float32)[sort_idx]
+        r_6 = np.array(r_6, dtype=np.float32)[sort_idx]
+        r_12 = np.array(r_12, dtype=np.float32)[sort_idx]
+
+        # Generate atomic-free reduction map structures to prevent memory locks
+        flat_indices = np.concatenate([pairs_np[:, 0], pairs_np[:, 1]])
+        flat_signs = np.concatenate([np.ones(num_pairs, dtype=np.float32), np.full(num_pairs, -1.0, dtype=np.float32)])
+        flat_pair_map = np.concatenate([np.arange(num_pairs, dtype=np.int32), np.arange(num_pairs, dtype=np.int32)])
+
+        sort_reduction = np.argsort(flat_indices)
+        reduction_indices = flat_indices[sort_reduction]
+        reduction_signs = flat_signs[sort_reduction]
+        reduction_pair_map = flat_pair_map[sort_reduction]
+    else:
+        reduction_indices = np.zeros(0, dtype=np.int32)
+        reduction_signs = np.zeros(0, dtype=np.float32)
+        reduction_pair_map = np.zeros(0, dtype=np.int32)
+
     return (
-        jnp.array(rot_centers), jnp.array(rot_axes), jnp.array(is_free_mask),
-        jnp.array(pairs, dtype=jnp.int32), jnp.array(elec_param, dtype=jnp.float32),
-        jnp.array(eps, dtype=jnp.float32), jnp.array(r_6, dtype=jnp.float32), 
+        jnp.array(center_indices), jnp.array(axis_indices), jnp.array(is_free_mask),
+        jnp.array(pairs_np, dtype=jnp.int32), jnp.array(elec_param, dtype=jnp.float32),
+        jnp.array(eps, dtype=jnp.float32), jnp.array(r_6, dtype=jnp.float32),
         jnp.array(r_12, dtype=jnp.float32), jnp.array(atom_to_group, dtype=jnp.int32),
-        jnp.array(box) if box is not None else None
+        jnp.array(box) if box is not None else None,
+        jnp.array(box_inv) if box_inv is not None else None,
+        jnp.array(reduction_indices, dtype=jnp.int32),
+        jnp.array(reduction_signs, dtype=jnp.float32),
+        jnp.array(reduction_pair_map, dtype=jnp.int32)
     )
 
-@jax.jit
-def apply_rotations(init_coord, thetas, rot_centers, rot_axes, atom_to_bond_idx, box=None):
-    safe_bond_idx = jnp.where(atom_to_bond_idx == -1, 0, atom_to_bond_idx)
-    centers = rot_centers[safe_bond_idx] 
-    axes = rot_axes[safe_bond_idx]       
-    t = thetas[safe_bond_idx]            
-    
-    t = jnp.where(atom_to_bond_idx == -1, 0.0, t)
-    vecs = init_coord - centers
-    
-    if box is not None:
-        box_inv = jnp.linalg.inv(box)
-        frac = vecs @ box_inv
-        frac = frac - jnp.round(frac)
-        vecs = frac @ box
-        
-    cos_t = jnp.cos(t)[:, None]
-    sin_t = jnp.sin(t)[:, None]
-    
-    cross = jnp.cross(axes, vecs)
-    dot = jnp.sum(axes * vecs, axis=-1, keepdims=True)
-    rotated_vecs = vecs * cos_t + cross * sin_t + axes * dot * (1 - cos_t)
-    
-    new_coord = init_coord + (rotated_vecs - vecs)
-    return jnp.where(atom_to_bond_idx[:, None] == -1, init_coord, new_coord)
+@jax.custom_vjp
+def compute_energy(coord, pairs, elec_param, eps, r_6, r_12, box=None, box_inv=None, 
+                   reduction_indices=None, reduction_signs=None, reduction_pair_map=None):
+    return _compute_energy_fwd(coord, pairs, elec_param, eps, r_6, r_12, box, box_inv, 
+                               reduction_indices, reduction_signs, reduction_pair_map)[0]
 
-@jax.jit
-def compute_energy(coord, pairs, elec_param, eps, r_6, r_12, box=None):
+def _compute_energy_fwd(coord, pairs, elec_param, eps, r_6, r_12, box=None, box_inv=None,
+                       reduction_indices=None, reduction_signs=None, reduction_pair_map=None):
     delta = coord[pairs[:, 0]] - coord[pairs[:, 1]]
-    if box is not None:
-        box_inv = jnp.linalg.inv(box)
-        frac_delta = delta @ box_inv
-        frac_delta = frac_delta - jnp.round(frac_delta)
-        delta = frac_delta @ box
+    if box is not None and box_inv is not None:
+        frac_x = delta[:, 0] * box_inv[0, 0] + delta[:, 1] * box_inv[1, 0] + delta[:, 2] * box_inv[2, 0]
+        frac_y = delta[:, 0] * box_inv[0, 1] + delta[:, 1] * box_inv[1, 1] + delta[:, 2] * box_inv[2, 1]
+        frac_z = delta[:, 0] * box_inv[0, 2] + delta[:, 1] * box_inv[1, 2] + delta[:, 2] * box_inv[2, 2]
         
-    dist_sq = jnp.sum(delta**2, axis=-1)
-    dist_6 = dist_sq ** 3
-    e_nb = eps * (r_12 / (dist_6 ** 2) - 2 * r_6 / dist_6)
-    return jnp.sum(elec_param / jnp.sqrt(dist_sq) + e_nb)
-
-@jax.jit(static_argnames=("iterations", "return_trajectory"))
-def relax_hydrogen_jit(init_coord, rot_centers, rot_axes, is_free_mask, pairs, 
-                       elec_param, eps, r_6, r_12, atom_to_bond_idx, box=None, 
-                       iterations: int = 200, return_trajectory: bool = False,
-                       start_angle: float = 0.0):
-    B = rot_centers.shape[0]
-    
-    # Tiny offset added to ensure perfectly balanced states have gradient
-    thetas = jnp.full(B, start_angle + 1e-3)
-    m = jnp.zeros(B)
-    v = jnp.zeros(B)
-    lr = 0.1
-    
-    def scan_body(carry, _):
-        t, m_t, v_t, step = carry
+        frac_x = frac_x - jnp.round(frac_x)
+        frac_y = frac_y - jnp.round(frac_y)
+        frac_z = frac_z - jnp.round(frac_z)
         
-        def loss_fn(ang):
-            c = apply_rotations(init_coord, ang, rot_centers, rot_axes, atom_to_bond_idx, box)
-            return compute_energy(c, pairs, elec_param, eps, r_6, r_12, box)
+        delta_x = frac_x * box[0, 0] + frac_y * box[1, 0] + frac_z * box[2, 0]
+        delta_y = frac_x * box[0, 1] + frac_y * box[1, 1] + frac_z * box[2, 1]
+        delta_z = frac_x * box[0, 2] + frac_y * box[1, 2] + frac_z * box[2, 2]
+        dist_sq = delta_x * delta_x + delta_y * delta_y + delta_z * delta_z
+        wrapped_delta = jnp.stack([delta_x, delta_y, delta_z], axis=-1)
+    else:
+        dist_sq = jnp.sum(delta * delta, axis=-1)
+        wrapped_delta = delta
+        
+    dist_6 = dist_sq * dist_sq * dist_sq
+    dist_12 = dist_6 * dist_6
+    e_nb = eps * (r_12 / dist_12 - 2.0 * r_6 / dist_6)
+    energy = jnp.sum(elec_param / jnp.sqrt(dist_sq + 1e-8) + e_nb)
+    
+    return energy, (coord, pairs, elec_param, eps, r_6, r_12, box, box_inv, wrapped_delta, dist_sq, dist_6, 
+                    reduction_indices, reduction_signs, reduction_pair_map)
 
-        loss, grads = jax.value_and_grad(loss_fn)(t)
+def _compute_energy_bwd(res, g):
+    (coord, pairs, elec_param, eps, r_6, r_12, box, box_inv, wrapped_delta, dist_sq, dist_6, 
+     reduction_indices, reduction_signs, reduction_pair_map) = res
+    
+    inv_dist_sq = 1.0 / (dist_sq + 1e-8)
+    inv_dist_1 = jnp.sqrt(inv_dist_sq)
+    
+    de_elec = -0.5 * elec_param * (inv_dist_sq * inv_dist_1)
+    de_vdw = eps * 6.0 * inv_dist_sq * (-r_12 / (dist_6 * dist_6) + r_6 / dist_6)
+    dE_ddist_sq = (de_elec + de_vdw) * g
+    
+    pair_forces = 2.0 * dE_ddist_sq[..., None] * wrapped_delta
+    
+    # Run coalesced GPU Segment Reductions to map pairwise interactions instantly
+    mapped_forces = pair_forces[reduction_pair_map] * reduction_signs[..., None]
+    grad_coord = jax.ops.segment_sum(mapped_forces, reduction_indices, num_segments=coord.shape[0])
+    
+    return grad_coord, None, None, None, None, None, None, None, None, None, None
+
+compute_energy.defvjp(_compute_energy_fwd, _compute_energy_bwd)
+
+def _get_nerf_params(atoms, atom_to_bond_idx, center_indices, axis_indices, box=None):
+    """Calculates chemically rigid NeRF parameters using exact covalent graph traversal."""
+    num_atoms = atoms.array_length()
+    
+    p1_idx = np.zeros(num_atoms, dtype=int)
+    p2_idx = np.zeros(num_atoms, dtype=int)
+    p3_idx = np.zeros(num_atoms, dtype=int)
+    ref_v = np.zeros((num_atoms, 3), dtype=np.float32)
+    use_ref_v = np.zeros(num_atoms, dtype=bool)
+    
+    bonds, _ = atoms.bonds.get_all_bonds()
+    heavy_mask = (atoms.element != "H") & (atoms.element != "D")
+    h_mask = ~heavy_mask
+    
+    h_indices = np.where(h_mask)[0]
+    heavy_indices = np.where(heavy_mask)[0]
+    coord = atoms.coord
+    
+    def min_image_np(vecs):
+        if box is None: return vecs
+        box_inv = np.linalg.inv(box)
+        frac = vecs @ box_inv
+        frac -= np.round(frac)
+        return frac @ box
+    
+    for h in h_indices:
+        b = atom_to_bond_idx[h]
+        if b != -1:
+            # Enforce strict alignment with Hydride's energy axis for rotatable bonds
+            p1 = center_indices[b]
+            p2 = axis_indices[b]
+        else:
+            # For fixed hydrogens, traverse the covalent graph to find P1 and P2
+            h_neighbors = [n for n in bonds[h] if n != -1 and heavy_mask[n]]
+            p1 = h_neighbors[0] if h_neighbors else heavy_indices[0]
+            
+            p1_neighbors = [n for n in bonds[p1] if n != -1 and heavy_mask[n] and n != h]
+            p2 = p1_neighbors[0] if p1_neighbors else p1
+            
+        # Topologically discover P3 to complete the local rotameric frame
+        p3_candidates = []
+        
+        # 1. PRIORITY: Other heavy atoms bonded directly to P1 (e.g., C_epsilon for a CH2 on C_delta)
+        # This guarantees methylene and methine protons are perfectly symmetric to local heavy neighbors.
+        p3_candidates.extend([n for n in bonds[p1] if n != -1 and heavy_mask[n] and n != p2 and n != h])
+        
+        # 2. FALLBACK: Heavy atoms bonded to P2 (e.g., C_beta for a terminal CH3 on C_gamma)
+        if p2 != p1:
+            p3_candidates.extend([n for n in bonds[p2] if n != -1 and heavy_mask[n] and n != p1])
+        
+        found_p3 = False
+        v1_vec = min_image_np(coord[p2] - coord[p1])        
+
+        # Ensure the chosen P3 is not collinear with P1-P2
+        for candidate in p3_candidates:
+            v2_vec = min_image_np(coord[candidate] - coord[p1])
+            v2_vec = v2_vec / (np.linalg.norm(v2_vec) + 1e-8)
+            if np.linalg.norm(np.cross(v1_vec, v2_vec)) > 1e-2:
+                p3 = candidate
+                found_p3 = True
+                break
+                
+        if found_p3:
+            p1_idx[h] = p1
+            p2_idx[h] = p2
+            p3_idx[h] = p3
+            use_ref_v[h] = False
+        else:
+            # Fallback for perfectly collinear or isolated molecules (e.g., water, ethane)
+            v_r = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            if np.abs(np.dot(v1_vec, v_r)) > 0.9:
+                v_r = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            v_r = v_r - np.dot(v1_vec, v_r) * v1_vec
+            v_r = v_r / (np.linalg.norm(v_r) + 1e-8)
+            
+            p1_idx[h] = p1
+            p2_idx[h] = p2
+            p3_idx[h] = p1
+            ref_v[h] = v_r
+            use_ref_v[h] = True
+            
+    v1 = min_image_np(coord[p2_idx] - coord[p1_idx])
+    v1 = v1 / (np.linalg.norm(v1, axis=-1, keepdims=True) + 1e-8)
+    
+    v2 = np.where(use_ref_v[:, None], ref_v, min_image_np(coord[p3_idx] - coord[p1_idx]))
+    
+    n = np.cross(v1, v2)
+    n = n / (np.linalg.norm(n, axis=-1, keepdims=True) + 1e-8)
+    
+    v = np.cross(n, v1)
+    
+    delta = min_image_np(coord - coord[p1_idx])
+    x = np.sum(delta * v1, axis=-1)
+    y = np.sum(delta * v, axis=-1)
+    z = np.sum(delta * n, axis=-1)
+    
+    lengths = np.linalg.norm(delta, axis=-1)
+    angles = np.arctan2(np.hypot(y, z), x)
+    torsions = np.arctan2(z, y)
+    
+    return p1_idx, p2_idx, p3_idx, ref_v, use_ref_v, lengths, angles, torsions, h_mask
+
+def get_relaxation_params(atoms, mask=None, partial_charges=None, box=None):
+    base_params = _original_get_relaxation_params(atoms, mask, partial_charges, box=box)
+    if base_params is None:
+        return None
+        
+    atom_to_bond_idx = base_params[8]
+    center_indices = base_params[0]
+    axis_indices = base_params[1]
+    
+    p1, p2, p3, ref_v, use_ref_v, lengths, angles, torsions, h_mask = _get_nerf_params(
+        atoms, atom_to_bond_idx, center_indices, axis_indices, box=box
+    )
+    return tuple(base_params) + (p1, p2, p3, ref_v, use_ref_v, lengths, angles, torsions, h_mask)
+
+
+@jax.jit
+def place_hydrogens_jit(X_heavy, p1_idx, p2_idx, p3_idx, ref_v, use_ref_v, lengths, angles, torsions, h_mask, box=None, box_inv=None):
+    p1 = X_heavy[p1_idx]
+    p2 = X_heavy[p2_idx]
+    p3 = X_heavy[p3_idx]
+    
+    v1 = p2 - p1
+    if box is not None and box_inv is not None:
+        frac = jnp.einsum('...i,ij->...j', v1, box_inv)
+        frac = frac - jnp.round(frac)
+        v1 = jnp.einsum('...i,ij->...j', frac, box)
+        
+    v1 = v1 / jnp.sqrt(jnp.sum(v1**2, axis=-1, keepdims=True) + 1e-12)
+    
+    v2 = p3 - p1
+    if box is not None and box_inv is not None:
+        frac2 = jnp.einsum('...i,ij->...j', v2, box_inv)
+        frac2 = frac2 - jnp.round(frac2)
+        v2 = jnp.einsum('...i,ij->...j', frac2, box)
+        
+    v2 = jnp.where(use_ref_v[:, None], ref_v, v2)
+    
+    n = jnp.cross(v1, v2)
+    n = n / jnp.sqrt(jnp.sum(n**2, axis=-1, keepdims=True) + 1e-12)
+    
+    v = jnp.cross(n, v1)
+    
+    x = lengths * jnp.cos(angles)
+    y = lengths * jnp.sin(angles) * jnp.cos(torsions)
+    z = lengths * jnp.sin(angles) * jnp.sin(torsions)
+    
+    X_H = p1 + x[:, None]*v1 + y[:, None]*v + z[:, None]*n
+    
+    if box is not None and box_inv is not None:
+        diff = X_H - X_heavy
+        frac = jnp.einsum('...i,ij->...j', diff, box_inv)
+        frac = frac - jnp.round(frac)
+        X_H = X_heavy + jnp.einsum('...i,ij->...j', frac, box)
+    
+    # We always rebuild all hydrogens from NeRF to guarantee they co-move safely with heavy atoms
+    return jnp.where(h_mask[:, None], X_H, X_heavy)
+
+
+@functools.partial(jax.jit, static_argnames=("iterations", "return_trajectory"))
+def relax_hydrogen_jit(
+    X_initial, center_indices, axis_indices, is_free_mask, pairs, elec_param, eps, r_6, r_12,
+    atom_to_bond_idx, box, box_inv, reduction_indices, reduction_signs, reduction_pair_map,
+    p1_idx, p2_idx, p3_idx, ref_v, use_ref_v, lengths, angles, initial_torsions, h_mask,
+    iterations=200, return_trajectory=False, start_angle=0.0
+):
+    num_atoms = X_initial.shape[0]
+    B = center_indices.shape[0]
+    
+    init_delta_torsions = jnp.full(B, start_angle + 1e-3)
+    init_m = jnp.zeros(B)
+    init_v = jnp.zeros(B)
+    base_lr = 0.1
+    
+    def compute_X(d_torsions):
+        d_t = jnp.where(is_free_mask, d_torsions, 0.0)
+        d_t_padded = jnp.append(d_t, 0.0)
+        atom_shifts = d_t_padded[atom_to_bond_idx]
+        current_torsions = initial_torsions + atom_shifts
+        return place_hydrogens_jit(
+            X_initial, p1_idx, p2_idx, p3_idx, ref_v, use_ref_v, lengths, angles, current_torsions, h_mask, box, box_inv
+        )
+
+    def scan_body(carry, i):
+        d_torsions, m_t, v_t = carry
+        
+        def energy_fn(d_t):
+            X_current = compute_X(d_t)
+            from hydride.relax import compute_energy
+            return compute_energy(X_current, pairs, elec_param, eps, r_6, r_12,
+                                  box, box_inv, reduction_indices, reduction_signs, reduction_pair_map)
+        
+        ener, grads = jax.value_and_grad(energy_fn)(d_torsions)
         grads = jnp.where(is_free_mask, grads, 0.0)
         
-        progress = step / iterations
-        lr_t = lr * 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
+        progress = i / iterations
+        lr_t = base_lr * 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
         
         m_next = 0.9 * m_t + 0.1 * grads
         v_next = 0.999 * v_t + 0.001 * (grads ** 2)
-        m_hat = m_next / (1 - 0.9 ** (step + 1))
-        v_hat = v_next / (1 - 0.999 ** (step + 1))
-        t_next = t - lr_t * m_hat / (jnp.sqrt(v_hat) + 1e-8)
+        m_hat = m_next / (1.0 - 0.9 ** (i + 1))
+        v_hat = v_next / (1.0 - 0.999 ** (i + 1))
         
-        coord_t = jax.lax.cond(
+        d_torsions_new = d_torsions - lr_t * m_hat / (jnp.sqrt(v_hat) + 1e-8)
+        
+        X_current = jax.lax.cond(
             return_trajectory,
-            lambda: apply_rotations(init_coord, t_next, rot_centers, rot_axes, atom_to_bond_idx, box).astype(init_coord.dtype),
-            lambda: jnp.zeros_like(init_coord) 
+            lambda: compute_X(d_torsions_new),
+            lambda: jnp.zeros_like(X_initial)
         )
-        return (t_next, m_next, v_next, step + 1), (coord_t, loss)
-
-    (final_thetas, _, _, _), (trajectory, energies) = jax.lax.scan(
-        scan_body, (thetas, m, v, 0), jnp.arange(iterations)
-    )
-
-    energies = jax.lax.cummin(energies)
-
-    final_coord = apply_rotations(init_coord, final_thetas, rot_centers, rot_axes, atom_to_bond_idx, box)
-    return final_coord, trajectory, energies
+        return (d_torsions_new, m_next, v_next), (X_current, ener)
+        
+    if return_trajectory:
+        (final_delta_torsions, _, _), (traj, ener) = jax.lax.scan(scan_body, (init_delta_torsions, init_m, init_v), jnp.arange(iterations))
+        ener = jax.lax.cummin(ener)
+        final_X = compute_X(final_delta_torsions)
+        return final_X, traj, ener
+    else:
+        def step_body_simple(i, carry):
+            d_torsions, m_t, v_t = carry
+            def energy_fn_simple(dt):
+                X_current = compute_X(dt)
+                from hydride.relax import compute_energy
+                return compute_energy(X_current, pairs, elec_param, eps, r_6, r_12,
+                                      box, box_inv, reduction_indices, reduction_signs, reduction_pair_map)
+            
+            grads = jax.grad(energy_fn_simple)(d_torsions)
+            grads = jnp.where(is_free_mask, grads, 0.0)
+            
+            progress = i / iterations
+            lr_t = base_lr * 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
+            
+            m_next = 0.9 * m_t + 0.1 * grads
+            v_next = 0.999 * v_t + 0.001 * (grads ** 2)
+            m_hat = m_next / (1.0 - 0.9 ** (i + 1))
+            v_hat = v_next / (1.0 - 0.999 ** (i + 1))
+            
+            d_torsions_new = d_torsions - lr_t * m_hat / (jnp.sqrt(v_hat) + 1e-8)
+            return (d_torsions_new, m_next, v_next)
+            
+        final_delta_torsions, _, _ = jax.lax.fori_loop(0, iterations, step_body_simple, (init_delta_torsions, init_m, init_v))
+        
+        X_final = compute_X(final_delta_torsions)
+        from hydride.relax import compute_energy
+        final_energy = compute_energy(X_final, pairs, elec_param, eps, r_6, r_12,
+                                      box, box_inv, reduction_indices, reduction_signs, reduction_pair_map)
+        
+        return X_final, jnp.zeros((0, num_atoms, 3)), jnp.array([final_energy])
 
 
 def relax_hydrogen(atoms, iterations=200, mask=None, angle_increment=None, 
@@ -227,9 +473,7 @@ def relax_hydrogen(atoms, iterations=200, mask=None, angle_increment=None,
         iterations = 200
 
     atoms = atoms.copy()
-
     init_coord_np = atoms.coord
-    
     params = get_relaxation_params(atoms, mask, partial_charges, box=box)
     
     if params is None:
@@ -241,10 +485,10 @@ def relax_hydrogen(atoms, iterations=200, mask=None, angle_increment=None,
     best_coord, best_traj, best_energies = None, None, None
     min_final_energy = float('inf')
 
-    # Start at 0, 120, and 240 degrees to bypass any energy barriers reliably
     for ang in [0.0, 2.0 * np.pi / 3.0, 4.0 * np.pi / 3.0]:
         f_coord, traj, ener = relax_hydrogen_jit(
-            jnp.array(init_coord_np), *params, 
+            jnp.array(init_coord_np), 
+            *params,
             iterations=iterations, return_trajectory=return_trajectory,
             start_angle=ang
         )
@@ -256,15 +500,22 @@ def relax_hydrogen(atoms, iterations=200, mask=None, angle_increment=None,
             best_traj = traj
             best_energies = ener
 
+    # params[8] is atom_to_bond_idx. params[-1] is h_mask.
+    mobile_h_mask_np = np.array(params[-1] & (params[8] != -1))
+    if mask is not None:
+        mobile_h_mask_np &= mask
+
     if return_trajectory:
         out_coord = np.array(best_traj, copy=True).astype(np.float32)
+        # Restore multi-frame 3D coordinates for locked atoms
+        out_coord[:, ~mobile_h_mask_np, :] = init_coord_np[~mobile_h_mask_np, :]
     else:
         out_coord = np.array(best_coord, copy=True).astype(np.float32)
+        out_coord[~mobile_h_mask_np, :] = init_coord_np[~mobile_h_mask_np, :]
         
     if return_energies:
         return out_coord, np.array(best_energies, copy=True)
     return out_coord
-
 
 def _find_rotatable_bonds(atoms, mask=None):
     if mask is None:
