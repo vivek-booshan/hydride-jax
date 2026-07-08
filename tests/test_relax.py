@@ -580,3 +580,63 @@ def test_nerf_topology_independence_from_spatial_proximity():
         atol=1e-5, 
         err_msg="Hydrogen frame was corrupted by non-bonded spatial neighbors!"
     )
+
+def test_nerf_topology_local_bisector_priority():
+    """
+    Adversarial test: Ensure that the NeRF frame prioritizes local branches
+    (other heavy atoms bonded to P1) over looking backward down the chain
+    (heavy atoms bonded to P2). This ensures methylene hydrogens correctly
+    bisect the angle between their two immediate heavy neighbors.
+    """
+    import numpy as np
+    import biotite.structure as struc
+    import hydride
+
+    # Construct a chain: C0 - C1 - C2 - C3
+    # Attach H4 to C2.
+    # C2 is P1. C1 is P2 (first neighbor of C2).
+    # P3 should be C3 (local neighbor of C2), not C0 (backward neighbor of C1).
+    atoms = struc.AtomArray(5)
+    atoms.element = np.array(["C", "C", "C", "C", "H"])
+
+    # Coordinates must not be perfectly collinear to pass the cross product check.
+    atoms.coord = np.array([
+        [0.0, 0.0, 0.0],    # 0: C0
+        [1.5, 0.0, 0.0],    # 1: C1
+        [2.0, 1.0, 0.0],    # 2: C2
+        [3.5, 1.0, 0.0],    # 3: C3
+        [2.0, 1.0, 1.0]     # 4: H4 (Bonded to C2)
+    ], dtype=np.float32)
+
+    atoms.bonds = struc.BondList(5, np.array([
+        [0, 1, 1], # C0 - C1
+        [1, 2, 1], # C1 - C2
+        [2, 3, 1], # C2 - C3
+        [2, 4, 1]  # C2 - H4
+    ]))
+
+    # Setup dummy rotatable parameters so H4 is treated as locked/fixed for the frame check
+    atom_to_bond_idx = np.array([-1, -1, -1, -1, -1], dtype=np.int32)
+    center_indices = np.zeros(0, dtype=np.int32)
+    axis_indices = np.zeros(0, dtype=np.int32)
+
+    p1, p2, p3, ref_v, use_ref_v, lengths, angles, torsions, h_mask = hydride.relax._get_nerf_params(
+        atoms, atom_to_bond_idx, center_indices, axis_indices
+    )
+
+    h_idx = 4
+    c0_idx = 0
+    c1_idx = 1
+    c2_idx = 2
+    c3_idx = 3
+
+    assert p1[h_idx] == c2_idx, "P1 should be C2 (the covalently bonded parent)."
+    assert p2[h_idx] == c1_idx, "P2 should be C1 (the first heavy neighbor of C2)."
+
+    # ADVERSARIAL CHECK:
+    # The old code (backwards priority) would assign P3 to C0 (neighbor of P2).
+    # The new code (local branch priority) must assign P3 to C3 (neighbor of P1).
+    assert p3[h_idx] == c3_idx, (
+        f"P3 was incorrectly assigned to {p3[h_idx]}. It must be {c3_idx} (local bisector neighbor), "
+        f"not {c0_idx} (backward chain neighbor)."
+    )

@@ -256,16 +256,18 @@ def _get_nerf_params(atoms, atom_to_bond_idx, center_indices, axis_indices, box=
             
         # Topologically discover P3 to complete the local rotameric frame
         p3_candidates = []
-        if p2 != p1:
-            # 1. Prefer heavy atoms bonded to P2 (standard dihedrals)
-            p3_candidates.extend([n for n in bonds[p2] if n != -1 and heavy_mask[n] and n != p1])
-        # 2. Fallback to other heavy atoms bonded to P1 (branched centers)
+        
+        # 1. PRIORITY: Other heavy atoms bonded directly to P1 (e.g., C_epsilon for a CH2 on C_delta)
+        # This guarantees methylene and methine protons are perfectly symmetric to local heavy neighbors.
         p3_candidates.extend([n for n in bonds[p1] if n != -1 and heavy_mask[n] and n != p2 and n != h])
         
-        found_p3 = False
-        v1_vec = min_image_np(coord[p2] - coord[p1])
-        v1_vec = v1_vec / (np.linalg.norm(v1_vec) + 1e-8)
+        # 2. FALLBACK: Heavy atoms bonded to P2 (e.g., C_beta for a terminal CH3 on C_gamma)
+        if p2 != p1:
+            p3_candidates.extend([n for n in bonds[p2] if n != -1 and heavy_mask[n] and n != p1])
         
+        found_p3 = False
+        v1_vec = min_image_np(coord[p2] - coord[p1])        
+
         # Ensure the chosen P3 is not collinear with P1-P2
         for candidate in p3_candidates:
             v2_vec = min_image_np(coord[candidate] - coord[p1])
